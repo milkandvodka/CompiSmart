@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>compaRAG Static UI</title>
+    <link rel="stylesheet" href="../src/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>compaRAG</h1>
+          <p>Two-video RAG comparison workspace</p>
+        </div>
+        <div id="apiStatus" class="status">checking</div>
+      </header>
+
+      <section class="workspace">
+        <aside class="left">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>Index Videos</h2>
+              <button id="freshComparison" type="button" class="secondary">Fresh</button>
+            </div>
+            <form id="jobForm" class="stack" autocomplete="off">
+              <label>
+                Comparison ID
+                <input id="comparisonId" />
+              </label>
+              <label>
+                YouTube Shorts URL
+                <input id="youtubeUrl" placeholder="https://youtube.com/shorts/..." />
+              </label>
+              <label>
+                Instagram URL
+                <input id="instagramUrl" placeholder="https://www.instagram.com/p/..." />
+              </label>
+              <div class="two-col">
+                <label>
+                  Embeddings
+                  <select id="embeddingModel">
+                    <option value="quality">BGE-M3 - slow, most accurate</option>
+                    <option value="balanced">E5 base - balanced</option>
+                    <option value="fast">MiniLM - fastest, lower recall</option>
+                  </select>
+                  <small id="embeddingHint" class="hint">BGE-M3 is slower but better for multilingual RAG quality.</small>
+                </label>
+              </div>
+              <button id="runPipeline" type="submit">Run Pipeline</button>
+            </form>
+            <p id="jobHint" class="hint"></p>
+            <p id="jobError" class="error"></p>
+            <div id="jobBox"></div>
+          </section>
+        </aside>
+
+        <section class="center">
+          <div id="videoCards" class="cards">
+            <div class="empty">No comparison loaded.</div>
+          </div>
+        </section>
+
+        <section class="chat panel">
+          <div class="panel-head">
+            <h2>Chat</h2>
+            <span id="chatComparison">no comparison</span>
+          </div>
+          <div id="messages" class="messages">
+            <div class="empty">Ask about metrics, hooks, comments, creators, or improvements.</div>
+          </div>
+          <form id="chatForm" class="chat-form">
+            <textarea id="chatQuestion" placeholder="Ask a hard question..."></textarea>
+            <button id="sendChat" type="submit">Send</button>
+          </form>
+          <p id="chatError" class="error"></p>
+        </section>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

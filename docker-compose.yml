@@ -1,0 +1,23 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: comparag-api:local
+    ports:
+      - "8001:8000"
+    env_file:
+      - .env
+    environment:
+      COMPARAG_LLM_MODE: auto
+      COMPARAG_DISABLE_GEMINI: "1"
+      HF_HOME: /app/.cache/huggingface
+      TRANSFORMERS_CACHE: /app/.cache/huggingface
+      SENTENCE_TRANSFORMERS_HOME: /app/.cache/huggingface
+      GEMINI_TIMEOUT_SECONDS: "10"
+      GEMINI_MAX_RETRIES: "0"
+      OPENAI_TIMEOUT_SECONDS: "20"
+      OPENAI_MAX_RETRIES: "0"
+    volumes:
+      - ./.cache:/app/.cache
+    restart: unless-stopped
