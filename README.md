@@ -7,14 +7,16 @@ Pull normalized transcript and metadata for exactly two required inputs:
 
 ## Demo
 
-Watch the demo walkthrough of the app in action:
+Watch the full demo walkthrough showing extraction, transcript normalization, indexing, and chat-based comparison:
 
-<https://cdn.curtosis.xyz/2026-06-03%2011-11-54.mkv>
+[![Watch Demo](https://img.youtube.com/vi/mmI3pI3-AGE/maxresdefault.jpg)](https://youtu.be/mmI3pI3-AGE)
+
+**Video:** [watch demo](https://youtu.be/mmI3pI3-AGE)
 
 The demo uses these two example videos end-to-end (extraction, normalization, indexing, and chat):
 
-- YouTube: <https://www.youtube.com/shorts/H5Is2X5QyH0>
-- Instagram Reel: <https://www.instagram.com/reels/DZFSP3kJbm4/>
+* [YouTube Example](https://www.youtube.com/shorts/H5Is2X5QyH0)
+* [Instagram Example](https://www.instagram.com/reels/DZFSP3kJbm4/)
 
 ## Setup
 
