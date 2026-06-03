@@ -20,6 +20,8 @@ DEFAULT_OVERLAP_SECONDS = 2
 
 def build_transcript_chunks(video: JsonDict, profile: VideoProfile) -> list[RagChunk]:
     transcript = video.get("transcript") or {}
+    if transcript_is_suspicious_for_indexing(transcript, profile.duration_seconds):
+        return []
     text = transcript_text(transcript, preferred="english_normalized")
     if not text:
         return []
@@ -74,6 +76,17 @@ def build_transcript_chunks(video: JsonDict, profile: VideoProfile) -> list[RagC
         chunks.extend(build_word_windows(profile, text, raw_text, hinglish_text))
 
     return dedupe_chunks(chunks)
+
+
+def transcript_is_suspicious_for_indexing(transcript: JsonDict, duration_seconds: int | float | None) -> bool:
+    if str(transcript.get("kind") or "").lower() != "asr":
+        return False
+    if not isinstance(duration_seconds, (int, float)) or duration_seconds < 25:
+        return False
+    text = transcript_text(transcript, preferred="english_normalized")
+    word_count = len(text.split())
+    min_words = max(12, int(float(duration_seconds) / 4))
+    return word_count < min_words
 
 
 def build_timed_windows(

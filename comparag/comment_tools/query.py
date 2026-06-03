@@ -32,6 +32,11 @@ def query_comment_facts(
 
     text = question.lower()
     requested_video = requested_video_from_text(text)
+    if asks_most_liked_commenter(text):
+        row_limit = 1 if asks_for_single_top_user(text) else max_rows
+        return query_most_liked_commenters(facts, requested_video=requested_video, max_rows=row_limit)
+    if asks_top_comments(text):
+        return query_top_comment_facts(facts, requested_video=requested_video, max_rows=max_rows)
     phrases = extract_comment_phrases(question)
     if not phrases and should_resolve_comment_phrase_from_history(text):
         comment_ids = extract_comment_ids_from_history(history or [])
@@ -46,11 +51,6 @@ def query_comment_facts(
             max_rows=max_rows,
             map_unscoped_phrases=should_map_unscoped_phrases_to_platforms(question, phrases),
         )
-    if asks_most_liked_commenter(text):
-        row_limit = 1 if asks_for_single_top_user(text) else max_rows
-        return query_most_liked_commenters(facts, requested_video=requested_video, max_rows=row_limit)
-    if asks_top_comments(text):
-        return query_top_comment_facts(facts, requested_video=requested_video, max_rows=max_rows)
     return {"available": False, "answer_text": "", "citations": [], "facts": [], "note": "No exact comment-fact tool matched."}
 
 

@@ -34,3 +34,14 @@ audio.wav
 *.mp4
 *.m4a
 *.webm
+
+*.zip
+
+# Defensive: avoid accidentally committing credential/session artifacts
+*.session
+*.session.json
+cookies.txt
+instagram-cookies.txt
+.cache/instagram-cookies.txt
+.cache/instagrapi-session.json
+secrets.*

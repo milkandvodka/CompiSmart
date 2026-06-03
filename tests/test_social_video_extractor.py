@@ -1,14 +1,23 @@
 import argparse
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from social_video_extractor import (
     URLValidationError,
+    TranscriptResult,
     detect_platform,
     extract_instagram_shortcode,
     extract_youtube_video_id,
+    instagram_fallback_info_from_supplement,
+    instagram_supplement_has_media,
+    instagram_sessionid_from_cookie_file,
+    is_instagram_empty_media_error,
     normalize_thumbnails,
     parse_json3_caption,
     parse_vtt_or_srt_caption,
+    resolve_transcript,
     resolve_input_urls,
     collect_hashtags,
     normalize_comments,
@@ -17,6 +26,8 @@ from social_video_extractor import (
     normalize_instagram_raw_comment,
     fetch_fast_instagram_comments,
     choose_asr_provider,
+    extract_transcript,
+    asr_transcript_is_suspicious,
 )
 
 
@@ -86,6 +97,57 @@ class SocialVideoExtractorTests(unittest.TestCase):
         self.assertEqual(segments[0].start, 1.0)
         self.assertEqual(segments[0].duration, 2.0)
         self.assertEqual(segments[0].text, "Hello world")
+
+    @patch("social_video_extractor.fetch_caption_text")
+    def test_extract_transcript_prefers_raw_variant_before_translated_caption(self, fetch_mock):
+        translated_url = "https://www.youtube.com/api/timedtext?lang=hi&tlang=en&fmt=json3"
+        raw_url = "https://www.youtube.com/api/timedtext?lang=hi&fmt=json3"
+
+        def fake_fetch(url):
+            self.assertEqual(url, raw_url)
+            return '{"events":[{"tStartMs":0,"dDurationMs":2000,"segs":[{"utf8":"raw caption text"}]}]}'
+
+        fetch_mock.side_effect = fake_fetch
+
+        result = extract_transcript(
+            {
+                "automatic_captions": {
+                    "en": [{"url": translated_url, "ext": "json3"}],
+                }
+            },
+            "en",
+        )
+
+        self.assertTrue(result.available)
+        self.assertEqual(result.text, "raw caption text")
+        self.assertEqual(result.source, raw_url)
+        self.assertEqual(fetch_mock.call_count, 1)
+
+    @patch("social_video_extractor.fetch_caption_text")
+    def test_extract_transcript_falls_back_to_translated_when_raw_caption_fails(self, fetch_mock):
+        translated_url = "https://www.youtube.com/api/timedtext?lang=hi&tlang=en&fmt=json3"
+        raw_url = "https://www.youtube.com/api/timedtext?lang=hi&fmt=json3"
+
+        def fake_fetch(url):
+            if url == raw_url:
+                raise RuntimeError("raw caption failed")
+            self.assertEqual(url, translated_url)
+            return '{"events":[{"tStartMs":0,"dDurationMs":2000,"segs":[{"utf8":"translated caption text"}]}]}'
+
+        fetch_mock.side_effect = fake_fetch
+
+        result = extract_transcript(
+            {
+                "automatic_captions": {
+                    "en": [{"url": translated_url, "ext": "json3"}],
+                }
+            },
+            "en",
+        )
+
+        self.assertTrue(result.available)
+        self.assertEqual(result.text, "translated caption text")
+        self.assertEqual(result.source, translated_url)
 
     def test_parse_vtt_caption(self):
         segments = parse_vtt_or_srt_caption(
@@ -278,6 +340,163 @@ Again
         self.assertEqual(choose_asr_provider("auto", "token"), "hf")
         self.assertEqual(choose_asr_provider("auto", None), "local")
         self.assertEqual(choose_asr_provider("local", "token"), "local")
+
+    def test_short_asr_for_long_video_is_suspicious(self):
+        result = TranscriptResult(True, "tiny output", [], None, "audio.wav", "asr")
+
+        self.assertTrue(asr_transcript_is_suspicious(result, {"duration": 60}))
+
+    @patch("social_video_extractor.transcribe_audio")
+    @patch("social_video_extractor.download_audio_for_asr")
+    def test_resolve_transcript_retries_local_when_hosted_asr_is_suspicious(self, download_mock, transcribe_mock):
+        download_mock.return_value = Path("audio.wav")
+        transcribe_mock.side_effect = [
+            TranscriptResult(True, "tiny output", [], None, "audio.wav", "asr", engine="huggingface-inference"),
+            TranscriptResult(
+                True,
+                "A long enough local transcript with enough words to pass the duration-based quality gate safely.",
+                [],
+                "hi",
+                "audio.wav",
+                "asr",
+                engine="faster-whisper",
+            ),
+        ]
+
+        result = resolve_transcript(
+            info={"id": "yt", "duration": 60},
+            url="https://www.youtube.com/watch?v=yt",
+            platform="youtube",
+            preferred_caption_language="en",
+            transcribe_missing=True,
+            asr_provider="auto",
+            asr_model="base",
+            hf_asr_model="openai/whisper-large-v3-turbo",
+            hf_token="token",
+            asr_timeout_seconds=60,
+            asr_language=None,
+            asr_device="cpu",
+            asr_compute_type="int8",
+            asr_cache_dir=Path(".cache"),
+            keep_audio=True,
+            cookies=None,
+            cookies_from_browser=None,
+        )
+
+        self.assertTrue(result.available)
+        self.assertEqual(result.engine, "faster-whisper")
+        self.assertEqual(transcribe_mock.call_count, 2)
+        self.assertEqual(transcribe_mock.call_args_list[1].kwargs["provider"], "local")
+
+    @patch("social_video_extractor.transcribe_audio")
+    @patch("social_video_extractor.download_audio_for_asr")
+    def test_resolve_transcript_drops_suspicious_asr_when_local_retry_is_suspicious(self, download_mock, transcribe_mock):
+        download_mock.return_value = Path("audio.wav")
+        transcribe_mock.side_effect = [
+            TranscriptResult(True, "tiny output", [], None, "audio.wav", "asr", engine="huggingface-inference"),
+            TranscriptResult(True, "short again", [], "hi", "audio.wav", "asr", engine="faster-whisper"),
+        ]
+
+        result = resolve_transcript(
+            info={"id": "yt", "duration": 60},
+            url="https://www.youtube.com/watch?v=yt",
+            platform="youtube",
+            preferred_caption_language="en",
+            transcribe_missing=True,
+            asr_provider="auto",
+            asr_model="base",
+            hf_asr_model="openai/whisper-large-v3-turbo",
+            hf_token="token",
+            asr_timeout_seconds=60,
+            asr_language=None,
+            asr_device="cpu",
+            asr_compute_type="int8",
+            asr_cache_dir=Path(".cache"),
+            keep_audio=True,
+            cookies=None,
+            cookies_from_browser=None,
+        )
+
+        self.assertFalse(result.available)
+        self.assertEqual(result.text, "")
+        self.assertIn("not indexed as reliable", result.note)
+
+    def test_instagram_sessionid_from_cookie_file_reads_netscape_cookie(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cookies.txt"
+            path.write_text(
+                "# Netscape HTTP Cookie File\n"
+                "#HttpOnly_.instagram.com\tTRUE\t/\tTRUE\t1893456000\tsessionid\tabc123\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(instagram_sessionid_from_cookie_file(path), "abc123")
+
+    def test_detects_instagram_empty_media_error(self):
+        self.assertTrue(is_instagram_empty_media_error(Exception("[Instagram] ABC: Instagram sent an empty media response")))
+        self.assertFalse(is_instagram_empty_media_error(Exception("[YouTube] unavailable")))
+
+    def test_instagram_fallback_info_from_instagrapi_supplement(self):
+        supplement = {
+            "available": False,
+            "instagrapi": {
+                "available": True,
+                "media_id": "12345",
+                "media_info": {
+                    "caption_text": "Caption #tag",
+                    "video_url": "https://cdninstagram.com/video.mp4",
+                    "thumbnail_url": "https://cdninstagram.com/thumb.jpg",
+                    "video_duration": 12.5,
+                    "play_count": 1000,
+                    "like_count": 100,
+                    "comment_count": 10,
+                    "taken_at": "2026-06-01T10:00:00+00:00",
+                    "user": {"username": "creator", "pk": "9"},
+                },
+                "user_info": {"username": "creator", "full_name": "Creator", "follower_count": 2000},
+            },
+        }
+
+        info = instagram_fallback_info_from_supplement("https://www.instagram.com/reel/ABC123/", supplement)
+
+        self.assertTrue(instagram_supplement_has_media(supplement))
+        self.assertEqual(info["id"], "12345")
+        self.assertEqual(info["description"], "Caption #tag")
+        self.assertEqual(info["direct_media_url"], "https://cdninstagram.com/video.mp4")
+        self.assertEqual(info["thumbnail"], "https://cdninstagram.com/thumb.jpg")
+        self.assertEqual(info["duration"], 12.5)
+        self.assertEqual(info["view_count"], 1000)
+        self.assertEqual(info["uploader_url"], "https://www.instagram.com/creator/")
+        self.assertEqual(info["formats"][0]["format_id"], "instagrapi_video")
+
+    @patch("social_video_extractor.transcribe_audio")
+    @patch("social_video_extractor.download_audio_for_asr")
+    def test_resolve_transcript_uses_direct_media_url_for_asr(self, download_mock, transcribe_mock):
+        download_mock.return_value = Path("audio.mp4")
+        transcribe_mock.return_value = TranscriptResult(True, "hello", [], "en", "audio.mp4", "asr")
+
+        result = resolve_transcript(
+            info={"id": "ig", "direct_media_url": "https://cdninstagram.com/video.mp4"},
+            url="https://www.instagram.com/reel/ABC123/",
+            platform="instagram_reel",
+            preferred_caption_language="en",
+            transcribe_missing=True,
+            asr_provider="local",
+            asr_model="base",
+            hf_asr_model="openai/whisper-large-v3-turbo",
+            hf_token=None,
+            asr_timeout_seconds=60,
+            asr_language=None,
+            asr_device="cpu",
+            asr_compute_type="int8",
+            asr_cache_dir=Path(".cache"),
+            keep_audio=True,
+            cookies=None,
+            cookies_from_browser=None,
+        )
+
+        self.assertTrue(result.available)
+        self.assertEqual(download_mock.call_args.args[0], "https://cdninstagram.com/video.mp4")
 
 
 if __name__ == "__main__":

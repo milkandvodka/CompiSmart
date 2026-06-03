@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import datetime as dt
 import html
+import io
 import json
 import os
 import re
@@ -40,6 +42,17 @@ class ExtractorError(RuntimeError):
 
 class URLValidationError(ValueError):
     pass
+
+
+class SilentYtdlpLogger:
+    def debug(self, message: str) -> None:
+        pass
+
+    def warning(self, message: str) -> None:
+        pass
+
+    def error(self, message: str) -> None:
+        pass
 
 
 @dataclass
@@ -190,6 +203,7 @@ def extract_info(
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
+        "logger": SilentYtdlpLogger(),
         "skip_download": True,
         "writesubtitles": True,
         "writeautomaticsub": True,
@@ -206,6 +220,150 @@ def extract_info(
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
+
+
+def is_instagram_empty_media_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "instagram" in text and "empty media response" in text
+
+
+def first_nested_url(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, dict):
+        url = value.get("url")
+        if isinstance(url, str) and url.strip():
+            return url.strip()
+        for child in value.values():
+            nested = first_nested_url(child)
+            if nested:
+                return nested
+    if isinstance(value, list):
+        for child in value:
+            nested = first_nested_url(child)
+            if nested:
+                return nested
+    return None
+
+
+def timestamp_from_value(value: Any) -> int | None:
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return int(parsed.timestamp())
+    except ValueError:
+        return None
+
+
+def instagram_fallback_info_from_supplement(url: str, supplement: dict[str, Any] | None) -> dict[str, Any]:
+    instagrapi = supplement_value(supplement, ["instagrapi"])
+    if not isinstance(instagrapi, dict) or not instagrapi.get("available"):
+        instagrapi = {}
+    media_info = instagrapi.get("media_info") if isinstance(instagrapi.get("media_info"), dict) else {}
+    user_info = instagrapi.get("user_info") if isinstance(instagrapi.get("user_info"), dict) else {}
+    media_user = media_info.get("user") if isinstance(media_info.get("user"), dict) else {}
+    shortcode = extract_instagram_shortcode(url)
+
+    direct_video_url = (
+        first_nested_url(media_info.get("video_url"))
+        or first_nested_url(media_info.get("video_versions"))
+        or first_nested_url(supplement_value(supplement, ["video_url"]))
+    )
+    thumbnail = (
+        first_nested_url(media_info.get("thumbnail_url"))
+        or first_nested_url(media_info.get("image_versions2"))
+        or first_nested_url(supplement_value(supplement, ["display_url"]))
+    )
+    caption = (
+        media_info.get("caption_text")
+        or supplement_value(supplement, ["caption"])
+        or media_info.get("title")
+        or supplement_value(supplement, ["title"])
+    )
+    username = user_info.get("username") or media_user.get("username") or supplement_value(supplement, ["owner_username"])
+    full_name = user_info.get("full_name") or media_user.get("full_name") or username
+    media_id = instagrapi.get("media_id") or media_info.get("id") or media_info.get("pk") or shortcode
+    duration = media_info.get("video_duration") or media_info.get("duration") or supplement_value(supplement, ["video_duration"])
+    timestamp = (
+        timestamp_from_value(media_info.get("taken_at"))
+        or timestamp_from_value(supplement_value(supplement, ["date_utc"]))
+        or timestamp_from_value(media_info.get("caption", {}).get("created_at_utc") if isinstance(media_info.get("caption"), dict) else None)
+    )
+
+    formats = []
+    if direct_video_url:
+        formats.append(
+            {
+                "format_id": "instagrapi_video",
+                "format_note": "Instagrapi direct video URL",
+                "url": direct_video_url,
+                "ext": "mp4",
+                "protocol": "https",
+                "width": media_info.get("width"),
+                "height": media_info.get("height"),
+                "vcodec": "unknown",
+                "acodec": "unknown",
+            }
+        )
+
+    return make_json_safe(
+        {
+            "id": str(media_id or shortcode or "instagram_media"),
+            "display_id": shortcode,
+            "extractor": "instagrapi_fallback",
+            "extractor_key": "Instagram",
+            "webpage_url": url,
+            "original_url": url,
+            "title": caption or f"Instagram media {shortcode or ''}".strip(),
+            "description": caption,
+            "uploader": full_name,
+            "uploader_id": user_info.get("pk") or media_user.get("pk") or supplement_value(supplement, ["owner_id"]),
+            "uploader_url": f"https://www.instagram.com/{username}/" if username else None,
+            "timestamp": timestamp,
+            "duration": duration,
+            "view_count": media_info.get("view_count") or media_info.get("play_count") or supplement_value(supplement, ["video_view_count"]),
+            "like_count": media_info.get("like_count") or supplement_value(supplement, ["likes"]),
+            "comment_count": media_info.get("comment_count") or supplement_value(supplement, ["comments"]),
+            "thumbnail": thumbnail,
+            "display_url": thumbnail,
+            "direct_media_url": direct_video_url,
+            "formats": formats,
+            "comments": [],
+            "availability": "authenticated_instagram_fallback",
+        }
+    )
+
+
+def instagram_supplement_has_media(supplement: dict[str, Any] | None) -> bool:
+    return bool(
+        (
+            supplement_value(supplement, ["instagrapi", "available"])
+            and supplement_value(supplement, ["instagrapi", "media_info"])
+        )
+        or (supplement and supplement.get("available") and any(supplement.get(key) for key in ["video_url", "display_url", "caption", "mediaid"]))
+    )
+
+
+def instagram_empty_media_message(supplement: dict[str, Any] | None = None) -> str:
+    instagrapi_error = supplement_value(supplement, ["instagrapi", "error"])
+    instaloader_error = supplement_value(supplement, ["error"])
+    details = []
+    if instagrapi_error:
+        details.append(f"Instagrapi error: {instagrapi_error}")
+    if instaloader_error:
+        details.append(f"Instaloader error: {instaloader_error}")
+    suffix = f" {' '.join(details)}" if details else ""
+    return (
+        "Instagram returned an empty media response to yt-dlp and no authenticated fallback produced media metadata. "
+        "Refresh the Instagrapi session/cookies and retry with an accessible public Reel/post."
+        f"{suffix}"
+    )
 
 
 def download_audio_for_asr(
@@ -225,6 +383,7 @@ def download_audio_for_asr(
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
+        "logger": SilentYtdlpLogger(),
         "format": "bestaudio/best",
         "outtmpl": output_template,
         "noplaylist": True,
@@ -272,6 +431,36 @@ def downloaded_file_candidates(info: dict[str, Any], ydl: Any) -> list[str]:
         pass
 
     return candidates
+
+
+def instagram_sessionid_from_cookie_file(path: str | Path | None) -> str | None:
+    if not path:
+        return None
+    cookie_path = Path(path)
+    if not cookie_path.exists() or not cookie_path.is_file():
+        return None
+
+    try:
+        lines = cookie_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or (stripped.startswith("#") and not stripped.startswith("#HttpOnly_")):
+            continue
+        if stripped.startswith("#HttpOnly_"):
+            stripped = stripped[len("#HttpOnly_") :]
+        parts = stripped.split("\t")
+        if len(parts) >= 7:
+            domain, _, _, _, _, name, value = parts[:7]
+            if "instagram.com" in domain and name == "sessionid" and value:
+                return value
+        elif "instagram.com" in stripped and "sessionid" in stripped:
+            match = re.search(r"(?:^|[;\s])sessionid=([^;\s]+)", stripped)
+            if match:
+                return match.group(1)
+    return None
 
 
 def first_present(info: dict[str, Any], keys: list[str]) -> Any:
@@ -323,12 +512,7 @@ def choose_caption_track(
     info: dict[str, Any],
     preferred_language: str,
 ) -> tuple[str, str, dict[str, Any]] | None:
-    caption_groups = [
-        ("manual", info.get("subtitles") or {}),
-        ("automatic", info.get("automatic_captions") or {}),
-    ]
-
-    for kind, captions in caption_groups:
+    for kind, captions in caption_groups(info):
         if not isinstance(captions, dict) or not captions:
             continue
 
@@ -345,6 +529,13 @@ def choose_caption_track(
             return kind, language, entry
 
     return None
+
+
+def caption_groups(info: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    return [
+        ("manual", info.get("subtitles") or {}),
+        ("automatic", info.get("automatic_captions") or {}),
+    ]
 
 
 def choose_language(captions: dict[str, Any], preferred_language: str) -> str | None:
@@ -364,6 +555,27 @@ def choose_language(captions: dict[str, Any], preferred_language: str) -> str | 
     return languages[0] if languages else None
 
 
+def caption_language_order(captions: dict[str, Any], preferred_language: str) -> list[str]:
+    languages = list(captions)
+    chosen = choose_language(captions, preferred_language)
+    ordered: list[str] = []
+    if chosen:
+        ordered.append(chosen)
+
+    normalized = preferred_language.lower()
+    for language in languages:
+        language_lower = language.lower()
+        if language not in ordered and (language_lower == normalized or language_lower.startswith(f"{normalized}-")):
+            ordered.append(language)
+    for language in languages:
+        if language not in ordered and not caption_entries_are_translated(captions.get(language) or []):
+            ordered.append(language)
+    for language in languages:
+        if language not in ordered:
+            ordered.append(language)
+    return ordered
+
+
 def choose_caption_entry(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
     preferred_exts = ["json3", "vtt", "srt", "ttml", "srv3", "xml"]
     for ext in preferred_exts:
@@ -376,6 +588,81 @@ def choose_caption_entry(entries: list[dict[str, Any]]) -> dict[str, Any] | None
     return None
 
 
+def caption_entry_candidates(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    preferred_exts = ["json3", "vtt", "srt", "ttml", "srv3", "xml"]
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(entry: dict[str, Any]) -> None:
+        url = entry.get("url")
+        if not isinstance(url, str) or not url or url in seen:
+            return
+        seen.add(url)
+        ordered.append(entry)
+
+    for ext in preferred_exts:
+        for entry in entries:
+            if str(entry.get("ext", "")).lower() == ext and not caption_url_is_translated(entry.get("url")):
+                add(entry)
+        for entry in entries:
+            if str(entry.get("ext", "")).lower() == ext:
+                add(entry)
+    for entry in entries:
+        add(entry)
+    return ordered
+
+
+def caption_entries_are_translated(entries: list[dict[str, Any]]) -> bool:
+    usable = [entry for entry in entries if entry.get("url")]
+    return bool(usable) and all(caption_url_is_translated(entry.get("url")) for entry in usable)
+
+
+def caption_url_is_translated(url: Any) -> bool:
+    if not isinstance(url, str):
+        return False
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    return bool(query.get("tlang"))
+
+
+def raw_caption_entry_variant(entry: dict[str, Any]) -> dict[str, Any] | None:
+    url = entry.get("url")
+    if not caption_url_is_translated(url):
+        return None
+    parsed = urllib.parse.urlparse(str(url))
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    stripped_query = [(key, value) for key, value in query if key != "tlang"]
+    raw_url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(stripped_query)))
+    if raw_url == url:
+        return None
+    raw_entry = dict(entry)
+    raw_entry["url"] = raw_url
+    return raw_entry
+
+
+def transcript_track_candidates(info: dict[str, Any], preferred_language: str) -> list[tuple[str, str, dict[str, Any]]]:
+    candidates: list[tuple[str, str, dict[str, Any]]] = []
+    seen_urls: set[str] = set()
+    for kind, captions in caption_groups(info):
+        if not isinstance(captions, dict) or not captions:
+            continue
+        for language in caption_language_order(captions, preferred_language):
+            entries = captions.get(language) or []
+            if not isinstance(entries, list):
+                continue
+            for entry in caption_entry_candidates(entries):
+                raw_candidate = raw_caption_entry_variant(entry)
+                ordered_candidates = [raw_candidate, entry] if raw_candidate else [entry]
+                for candidate in ordered_candidates:
+                    if not candidate:
+                        continue
+                    url = candidate.get("url")
+                    if not isinstance(url, str) or not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    candidates.append((kind, language, candidate))
+    return candidates
+
+
 def fetch_caption_text(url: str) -> str:
     try:
         import requests  # type: ignore
@@ -384,46 +671,99 @@ def fetch_caption_text(url: str) -> str:
             "Missing dependency: requests. Install dependencies with: pip install -r requirements.txt"
         ) from exc
 
-    response = requests.get(url, timeout=30)
+    response = requests.get(
+        url,
+        timeout=30,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        },
+    )
     response.raise_for_status()
     return response.text
 
 
 def extract_transcript(info: dict[str, Any], preferred_language: str) -> TranscriptResult:
-    track = choose_caption_track(info, preferred_language)
-    if not track:
+    candidates = transcript_track_candidates(info, preferred_language)
+    if not candidates:
         note = "No subtitle or caption track was exposed for this video."
         if is_instagram_media(detect_platform(info.get("webpage_url") or "")):
             note += " Instagram media often needs authenticated cookies and may not publish captions."
         return TranscriptResult(False, "", [], None, None, None, note)
 
-    kind, language, entry = track
-    source_url = entry.get("url")
-    extension = str(entry.get("ext") or "").lower()
+    failures: list[str] = []
+    for kind, language, entry in candidates:
+        source_url = entry.get("url")
+        extension = str(entry.get("ext") or "").lower()
+        if not isinstance(source_url, str) or not source_url:
+            continue
 
-    try:
-        caption_text = fetch_caption_text(source_url)
-        segments = parse_caption(caption_text, extension)
-    except Exception as exc:
-        return TranscriptResult(
-            False,
-            "",
-            [],
-            language,
-            source_url,
-            kind,
-            f"Caption track was found but could not be read: {exc}",
-        )
+        try:
+            caption_text = fetch_caption_text(source_url)
+            segments = parse_caption(caption_text, extension)
+        except Exception as exc:
+            variant = "translated" if caption_url_is_translated(source_url) else "raw"
+            failures.append(f"{kind}/{language}/{variant}/{extension or 'unknown'}: {exc}")
+            continue
 
-    text = normalize_transcript_text(" ".join(segment.text for segment in segments))
+        text = normalize_transcript_text(" ".join(segment.text for segment in segments))
+        if text:
+            return TranscriptResult(
+                True,
+                text,
+                segments,
+                language,
+                source_url,
+                kind,
+                None,
+            )
+        failures.append(f"{kind}/{language}/{extension or 'unknown'}: Caption track was empty.")
+
+    note = "Caption tracks were found but could not be read."
+    if failures:
+        note += " Tried: " + " | ".join(failures[:4])
+        if len(failures) > 4:
+            note += f" | plus {len(failures) - 4} more."
+    first_kind, first_language, first_entry = candidates[0]
     return TranscriptResult(
-        bool(text),
-        text,
-        segments,
-        language,
-        source_url,
-        kind,
-        None if text else "Caption track was empty.",
+        False,
+        "",
+        [],
+        first_language,
+        first_entry.get("url"),
+        first_kind,
+        note,
+    )
+
+
+def asr_transcript_is_suspicious(result: TranscriptResult, info: dict[str, Any]) -> bool:
+    if not result.available or result.kind != "asr":
+        return False
+    duration = info.get("duration")
+    if not isinstance(duration, (int, float)) or duration < 25:
+        return False
+    word_count = len(result.text.split())
+    min_words = max(12, int(float(duration) / 4))
+    return word_count < min_words
+
+
+def suspicious_asr_result(result: TranscriptResult, info: dict[str, Any], original_note: str | None) -> TranscriptResult:
+    note = (
+        f"{original_note or 'No reliable platform transcript available'} "
+        f"ASR output looked suspiciously short for a {info.get('duration')} second video, so it was not indexed as reliable."
+    )
+    return TranscriptResult(
+        False,
+        "",
+        [],
+        result.language,
+        result.source,
+        result.kind,
+        note,
+        engine=result.engine,
+        model=result.model,
+        language_probability=result.language_probability,
+        audio_path=result.audio_path,
     )
 
 
@@ -453,16 +793,17 @@ def resolve_transcript(
 
     original_note = transcript.note
     audio_path: Path | None = None
+    asr_url = info.get("direct_media_url") if isinstance(info.get("direct_media_url"), str) else url
     try:
         audio_path = download_audio_for_asr(
-            url,
+            asr_url,
             platform=platform,
             video_id=str(info.get("id") or ""),
             cache_dir=asr_cache_dir,
             cookies=cookies,
             cookies_from_browser=cookies_from_browser,
         )
-        return transcribe_audio(
+        asr_result = transcribe_audio(
             audio_path,
             provider=asr_provider,
             model_name=asr_model,
@@ -474,6 +815,32 @@ def resolve_transcript(
             compute_type=asr_compute_type,
             previous_note=original_note,
         )
+        if asr_transcript_is_suspicious(asr_result, info):
+            selected_provider = choose_asr_provider(asr_provider, hf_token)
+            if selected_provider == "hf" and asr_provider != "hf":
+                try:
+                    local_result = transcribe_audio(
+                        audio_path,
+                        provider="local",
+                        model_name=asr_model,
+                        hf_model=hf_asr_model,
+                        hf_token=hf_token,
+                        timeout_seconds=asr_timeout_seconds,
+                        language=asr_language,
+                        device=asr_device,
+                        compute_type=asr_compute_type,
+                        previous_note=f"{original_note or ''} Hosted ASR output looked suspiciously short; local ASR was retried.".strip(),
+                    )
+                    if not asr_transcript_is_suspicious(local_result, info):
+                        return local_result
+                    return suspicious_asr_result(local_result, info, original_note)
+                except Exception as local_exc:
+                    asr_result.note = (
+                        f"{asr_result.note or original_note or ''} Hosted ASR output looked suspiciously short; "
+                        f"local ASR retry failed: {local_exc}"
+                    ).strip()
+            return suspicious_asr_result(asr_result, info, original_note)
+        return asr_result
     except Exception as exc:
         note = f"{original_note or 'No platform transcript available'} ASR fallback failed: {exc}"
         return TranscriptResult(False, "", [], None, None, None, note)
@@ -837,42 +1204,102 @@ def fetch_instagram_supplement(
             compress_json=False,
             quiet=True,
         )
-        if session_user:
-            loader.load_session_from_file(session_user)
+        with contextlib.redirect_stderr(io.StringIO()):
+            if session_user:
+                loader.load_session_from_file(session_user)
 
-        post = instaloader.Post.from_shortcode(loader.context, shortcode)
-        owner_profile = safe_getattr(post, "owner_profile")
-        supplement: dict[str, Any] = {
-            "available": True,
-            "source": "instaloader",
-            "shortcode": safe_getattr(post, "shortcode"),
-            "mediaid": safe_getattr(post, "mediaid"),
-            "owner_id": safe_getattr(post, "owner_id"),
-            "owner_username": safe_getattr(post, "owner_username"),
-            "title": safe_getattr(post, "title"),
-            "caption": safe_getattr(post, "caption"),
-            "caption_hashtags": list(safe_getattr(post, "caption_hashtags") or []),
-            "caption_mentions": list(safe_getattr(post, "caption_mentions") or []),
-            "tagged_users": list(safe_getattr(post, "tagged_users") or []),
-            "likes": safe_getattr(post, "likes"),
-            "comments": safe_getattr(post, "comments"),
-            "date_utc": isoformat_or_none(safe_getattr(post, "date_utc")),
-            "typename": safe_getattr(post, "typename"),
-            "is_video": safe_getattr(post, "is_video"),
-            "video_duration": safe_getattr(post, "video_duration"),
-            "video_view_count": safe_getattr(post, "video_view_count"),
-            "video_url": safe_getattr(post, "video_url"),
-            "display_url": safe_getattr(post, "url"),
-            "accessibility_caption": safe_getattr(post, "accessibility_caption"),
-            "location": normalize_instaloader_location(safe_getattr(post, "location")),
-            "owner_profile": normalize_instaloader_profile(owner_profile),
-            "sidecar_nodes": normalize_instaloader_sidecar(post),
-        }
-        if fetch_comments:
-            supplement["comment_objects"] = normalize_instaloader_comments(post, max_comments)
-        return make_json_safe(supplement)
+            post = instaloader.Post.from_shortcode(loader.context, shortcode)
+            owner_profile = safe_getattr(post, "owner_profile")
+            supplement: dict[str, Any] = {
+                "available": True,
+                "source": "instaloader",
+                "shortcode": safe_getattr(post, "shortcode"),
+                "mediaid": safe_getattr(post, "mediaid"),
+                "owner_id": safe_getattr(post, "owner_id"),
+                "owner_username": safe_getattr(post, "owner_username"),
+                "title": safe_getattr(post, "title"),
+                "caption": safe_getattr(post, "caption"),
+                "caption_hashtags": list(safe_getattr(post, "caption_hashtags") or []),
+                "caption_mentions": list(safe_getattr(post, "caption_mentions") or []),
+                "tagged_users": list(safe_getattr(post, "tagged_users") or []),
+                "likes": safe_getattr(post, "likes"),
+                "comments": safe_getattr(post, "comments"),
+                "date_utc": isoformat_or_none(safe_getattr(post, "date_utc")),
+                "typename": safe_getattr(post, "typename"),
+                "is_video": safe_getattr(post, "is_video"),
+                "video_duration": safe_getattr(post, "video_duration"),
+                "video_view_count": safe_getattr(post, "video_view_count"),
+                "video_url": safe_getattr(post, "video_url"),
+                "display_url": safe_getattr(post, "url"),
+                "accessibility_caption": safe_getattr(post, "accessibility_caption"),
+                "location": normalize_instaloader_location(safe_getattr(post, "location")),
+                "owner_profile": normalize_instaloader_profile(owner_profile),
+                "sidecar_nodes": normalize_instaloader_sidecar(post),
+            }
+            if fetch_comments:
+                supplement["comment_objects"] = normalize_instaloader_comments(post, max_comments)
+            return make_json_safe(supplement)
     except Exception as exc:
         return {"available": False, "source": "instaloader", "error": str(exc)}
+
+
+def sanitize_error_text(text: str, secrets: Iterable[str | None]) -> str:
+    sanitized = text
+    for secret in secrets:
+        if not secret or len(secret) < 3:
+            continue
+        sanitized = sanitized.replace(secret, "[redacted]")
+    return sanitized
+
+
+def summarize_instagram_auth_error(exc: Exception, secrets: Iterable[str | None]) -> str:
+    text = sanitize_error_text(str(exc), secrets).strip()
+    lower = text.lower()
+    if "challenge" in lower:
+        return (
+            "Instagram challenge_required: approve the login/checkpoint in the Instagram app or browser, "
+            "then retry; alternatively set INSTAGRAM_SESSIONID from a trusted logged-in browser session."
+        )
+    if "login_required" in lower:
+        return (
+            "Instagram login_required: the authenticated session was rejected for this media. "
+            "Refresh the Instagrapi session/cookies, approve any login checkpoint, or set INSTAGRAM_SESSIONID."
+        )
+    return text[:600] or exc.__class__.__name__
+
+
+def create_instagrapi_client(
+    instagrapi: Any,
+    *,
+    settings_path: Path | None,
+    username: str | None,
+    password: str | None,
+    verification_code: str | None,
+    sessionid: str | None,
+    load_settings: bool,
+) -> Any:
+    client = instagrapi.Client()
+    if load_settings and settings_path and settings_path.exists():
+        client.set_settings(client.load_settings(settings_path))
+
+    if sessionid:
+        client.login_by_sessionid(sessionid)
+    elif username and password:
+        client.login(username, password, verification_code=verification_code or "")
+        if settings_path:
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            client.dump_settings(settings_path)
+
+    return client
+
+
+def fetch_instagrapi_media_info(client: Any, url: str, media_id: str | None) -> tuple[str, dict[str, Any]]:
+    shortcode = extract_instagram_shortcode(url)
+    if not media_id and not shortcode:
+        raise ExtractorError("Could not parse Instagram shortcode for Instagrapi media lookup.")
+    resolved_media_id = media_id or str(client.media_pk_from_code(shortcode))
+    media_info = safe_model_dump(client.media_info_v1(resolved_media_id))
+    return resolved_media_id, media_info
 
 
 def fetch_instagram_instagrapi_supplement(
@@ -899,25 +1326,37 @@ def fetch_instagram_instagrapi_supplement(
             "error": "No explicit Instagrapi session, sessionid, or username/password was provided.",
         }
 
+    secrets = [username, password, verification_code, sessionid]
+
     try:
         instagrapi = load_instagrapi()
-        client = instagrapi.Client()
-        if settings_path and settings_path.exists():
-            client.set_settings(client.load_settings(settings_path))
+        client = create_instagrapi_client(
+            instagrapi,
+            settings_path=settings_path,
+            username=username,
+            password=password,
+            verification_code=verification_code,
+            sessionid=sessionid,
+            load_settings=True,
+        )
 
-        if sessionid:
-            client.login_by_sessionid(sessionid)
-        elif username and password:
-            client.login(username, password, verification_code=verification_code or "")
-            if settings_path:
-                settings_path.parent.mkdir(parents=True, exist_ok=True)
-                client.dump_settings(settings_path)
+        try:
+            resolved_media_id, media_info = fetch_instagrapi_media_info(client, url, media_id)
+        except Exception as media_exc:
+            if username and password and settings_path:
+                client = create_instagrapi_client(
+                    instagrapi,
+                    settings_path=settings_path,
+                    username=username,
+                    password=password,
+                    verification_code=verification_code,
+                    sessionid=None,
+                    load_settings=False,
+                )
+                resolved_media_id, media_info = fetch_instagrapi_media_info(client, url, media_id)
+            else:
+                raise media_exc
 
-        shortcode = extract_instagram_shortcode(url)
-        if not media_id and not shortcode:
-            raise ExtractorError("Could not parse Instagram shortcode for Instagrapi media lookup.")
-        resolved_media_id = media_id or str(client.media_pk_from_code(shortcode))
-        media_info = safe_model_dump(client.media_info_v1(resolved_media_id))
         comments: list[dict[str, Any]] = []
         comment_fetch: dict[str, Any] = {"requested": fetch_comments, "strategy": None}
         if fetch_comments:
@@ -974,7 +1413,11 @@ def fetch_instagram_instagrapi_supplement(
             }
         )
     except Exception as exc:
-        return {"available": False, "source": "instagrapi", "error": str(exc)}
+        return {
+            "available": False,
+            "source": "instagrapi",
+            "error": summarize_instagram_auth_error(exc, secrets),
+        }
 
 
 def fetch_instagrapi_comment_replies(
@@ -1741,60 +2184,78 @@ def extract_pair(
             instagram_password=instagram_password,
             instagram_sessionid=instagram_sessionid,
         )
+        supplemental_metadata: dict[str, Any] | None = None
+
+        def fetch_supplement(media_id: str | None = None) -> dict[str, Any] | None:
+            return build_instagram_supplemental_metadata(
+                url=url,
+                media_id=media_id,
+                fetch_comments=fetch_comments,
+                max_comments=max_comments,
+                use_instaloader=use_instaloader,
+                instaloader_session_user=instaloader_session_user,
+                use_instagrapi=use_instagrapi,
+                instagrapi_settings=instagrapi_settings,
+                instagram_username=instagram_username,
+                instagram_password=instagram_password,
+                instagram_verification_code=instagram_verification_code,
+                instagram_sessionid=instagram_sessionid,
+                fetch_comment_replies=fetch_comment_replies,
+                max_comment_replies=max_comment_replies,
+                comment_time_budget_seconds=comment_time_budget_seconds,
+            )
 
         supplemental_future: concurrent.futures.Future[dict[str, Any] | None] | None = None
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as inner_executor:
             if is_instagram_media(platform) and auth_available:
                 supplemental_future = inner_executor.submit(
-                    build_instagram_supplemental_metadata,
-                    url=url,
-                    media_id=None,
-                    fetch_comments=fetch_comments,
-                    max_comments=max_comments,
-                    use_instaloader=use_instaloader,
-                    instaloader_session_user=instaloader_session_user,
-                    use_instagrapi=use_instagrapi,
-                    instagrapi_settings=instagrapi_settings,
-                    instagram_username=instagram_username,
-                    instagram_password=instagram_password,
-                    instagram_verification_code=instagram_verification_code,
-                    instagram_sessionid=instagram_sessionid,
-                    fetch_comment_replies=fetch_comment_replies,
-                    max_comment_replies=max_comment_replies,
-                    comment_time_budget_seconds=comment_time_budget_seconds,
+                    fetch_supplement,
+                    None,
                 )
 
             stage_started = time_module.monotonic()
-            info = extract_info(
-                url,
-                cookies=cookies,
-                cookies_from_browser=cookies_from_browser,
-                fetch_comments=fetch_comments and not (is_instagram_media(platform) and auth_available),
-            )
-            timing["base_metadata_seconds"] = round(time_module.monotonic() - stage_started, 3)
+            try:
+                info = extract_info(
+                    url,
+                    cookies=cookies,
+                    cookies_from_browser=cookies_from_browser,
+                    fetch_comments=fetch_comments and not (is_instagram_media(platform) and auth_available),
+                )
+                timing["base_metadata_seconds"] = round(time_module.monotonic() - stage_started, 3)
+            except Exception as exc:
+                timing["base_metadata_seconds"] = round(time_module.monotonic() - stage_started, 3)
+                if not (is_instagram_media(platform) and is_instagram_empty_media_error(exc)):
+                    raise ExtractorError(f"{platform} metadata extraction failed: {exc}") from exc
+
+                supplement_started = time_module.monotonic()
+                if supplemental_future is not None:
+                    supplemental_metadata = supplemental_future.result()
+                    timing["supplemental_metadata_wait_seconds"] = round(time_module.monotonic() - supplement_started, 3)
+                else:
+                    supplemental_metadata = fetch_supplement(None)
+                    timing["supplemental_metadata_seconds"] = round(time_module.monotonic() - supplement_started, 3)
+
+                if not instagram_supplement_has_media(supplemental_metadata) and use_instaloader:
+                    instaloader_supplement = fetch_instagram_supplement(
+                        url,
+                        fetch_comments=fetch_comments,
+                        max_comments=max_comments,
+                        session_user=instaloader_session_user,
+                    )
+                    if supplemental_metadata and isinstance(supplemental_metadata, dict):
+                        instaloader_supplement["instagrapi"] = supplemental_metadata.get("instagrapi")
+                    supplemental_metadata = instaloader_supplement
+
+                if not instagram_supplement_has_media(supplemental_metadata):
+                    raise ExtractorError(instagram_empty_media_message(supplemental_metadata)) from exc
+
+                info = instagram_fallback_info_from_supplement(url, supplemental_metadata)
+                info["fallback_reason"] = "yt-dlp Instagram empty media response"
 
             if is_instagram_media(platform) and supplemental_future is None:
                 media_id = None
-                supplemental_metadata = build_instagram_supplemental_metadata(
-                    url=url,
-                    media_id=media_id,
-                    fetch_comments=fetch_comments,
-                    max_comments=max_comments,
-                    use_instaloader=use_instaloader,
-                    instaloader_session_user=instaloader_session_user,
-                    use_instagrapi=use_instagrapi,
-                    instagrapi_settings=instagrapi_settings,
-                    instagram_username=instagram_username,
-                    instagram_password=instagram_password,
-                    instagram_verification_code=instagram_verification_code,
-                    instagram_sessionid=instagram_sessionid,
-                    fetch_comment_replies=fetch_comment_replies,
-                    max_comment_replies=max_comment_replies,
-                    comment_time_budget_seconds=comment_time_budget_seconds,
-                )
+                supplemental_metadata = fetch_supplement(media_id)
                 timing["supplemental_metadata_seconds"] = 0.0
-            else:
-                supplemental_metadata = None
 
             stage_started = time_module.monotonic()
             transcript_future = inner_executor.submit(
@@ -1818,7 +2279,7 @@ def extract_pair(
                 cookies_from_browser=cookies_from_browser,
             )
 
-            if supplemental_future is not None:
+            if supplemental_future is not None and supplemental_metadata is None:
                 supplement_started = time_module.monotonic()
                 supplemental_metadata = supplemental_future.result()
                 timing["supplemental_metadata_wait_seconds"] = round(time_module.monotonic() - supplement_started, 3)
@@ -1971,6 +2432,20 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         youtube_url, instagram_url = resolve_input_urls(args)
+        instagram_username = args.instagram_username or os.environ.get("INSTAGRAM_USERNAME") or os.environ.get("IG_USERNAME")
+        instagram_password = args.instagram_password or os.environ.get("INSTAGRAM_PASSWORD") or os.environ.get("IG_PASSWORD")
+        instagram_verification_code = (
+            args.instagram_verification_code
+            or os.environ.get("INSTAGRAM_VERIFICATION_CODE")
+            or os.environ.get("IG_VERIFICATION_CODE")
+        )
+        cookie_path = args.cookies or os.environ.get("INSTAGRAM_COOKIES") or os.environ.get("IG_COOKIES")
+        instagram_sessionid = (
+            args.instagram_sessionid
+            or os.environ.get("INSTAGRAM_SESSIONID")
+            or os.environ.get("IG_SESSIONID")
+            or instagram_sessionid_from_cookie_file(cookie_path)
+        )
         result = extract_pair(
             youtube_url,
             instagram_url,
@@ -1983,10 +2458,10 @@ def main(argv: list[str] | None = None) -> int:
             instaloader_session_user=args.instaloader_session_user,
             use_instagrapi=args.use_instagrapi,
             instagrapi_settings=Path(args.instagrapi_settings) if args.instagrapi_settings else None,
-            instagram_username=args.instagram_username,
-            instagram_password=args.instagram_password,
-            instagram_verification_code=args.instagram_verification_code,
-            instagram_sessionid=args.instagram_sessionid,
+            instagram_username=instagram_username,
+            instagram_password=instagram_password,
+            instagram_verification_code=instagram_verification_code,
+            instagram_sessionid=instagram_sessionid,
             fetch_comment_replies=args.fetch_comment_replies,
             max_comment_replies=args.max_comment_replies,
             comment_time_budget_seconds=args.comment_time_budget_seconds,

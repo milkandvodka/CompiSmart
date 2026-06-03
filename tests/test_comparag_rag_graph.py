@@ -8,11 +8,14 @@ from comparag.rag_graph import (
     MAX_RETRIEVED_CONTEXT_CHARS,
     RagChatEngine,
     build_prompt,
+    fallback_evidence_plan,
     fallback_evidence_plan_for_route,
     fallback_route_question,
     plan_question_with_llm,
     format_retrieved,
+    retrieve_for_evidence_plan,
     retrieve_for_route,
+    retrieval_questions,
     validate_answer_citations,
 )
 
@@ -130,7 +133,7 @@ class ComparagRagGraphTests(unittest.TestCase):
         self.assertEqual(plan["route"], "comments")
         self.assertTrue(plan["use_comment_fact_tool"])
 
-    def test_comment_fact_tool_is_forced_for_exact_comment_fields(self):
+    def test_llm_planner_can_decline_exact_comment_tool(self):
         class PlannerLLM(EchoPromptLLM):
             def complete(self, prompt):
                 self.prompts.append(prompt)
@@ -157,8 +160,98 @@ class ComparagRagGraphTests(unittest.TestCase):
         )
 
         self.assertEqual(plan["route"], "comments")
+        self.assertFalse(plan["use_comment_fact_tool"])
+        self.assertFalse(plan["tool_only"])
+
+    def test_fallback_planner_uses_exact_comment_tool_for_exact_comment_fields(self):
+        plan = fallback_evidence_plan(
+            "Show Instagram comments with usernames, user ids, and profile URLs.",
+            history=[],
+            planner_error="planner failed",
+        )
+
+        self.assertEqual(plan["route"], "comments")
         self.assertTrue(plan["use_comment_fact_tool"])
         self.assertTrue(plan["tool_only"])
+
+    def test_entity_name_lookup_retrieves_transcripts_and_comment_chunks_without_exact_comment_tool(self):
+        plan = fallback_evidence_plan(
+            "What is the name of the series and what was the name of his son?",
+            history=[],
+            planner_error="planner failed",
+        )
+
+        self.assertEqual(plan["route"], "general")
+        self.assertTrue(plan["balanced_retrieval"])
+        self.assertFalse(plan["use_comment_fact_tool"])
+        self.assertFalse(plan["tool_only"])
+        self.assertIn("transcript_window", plan["doc_types"])
+        self.assertIn("top_comments", plan["doc_types"])
+        self.assertIn("comment_intelligence_summary", plan["doc_types"])
+        self.assertGreaterEqual(plan["n_results"], 12)
+
+    def test_llm_entity_lookup_plan_is_expanded_to_comment_evidence(self):
+        class PlannerLLM(EchoPromptLLM):
+            def complete(self, prompt):
+                self.prompts.append(prompt)
+                return json.dumps(
+                    {
+                        "route": "general",
+                        "needs_structured_metrics": False,
+                        "balanced_retrieval": False,
+                        "doc_types": ["transcript_window"],
+                        "use_comment_fact_tool": False,
+                        "tool_only": False,
+                        "reason": "test",
+                    }
+                )
+
+        plan = plan_question_with_llm(
+            question="Which series is this and who was the son?",
+            history=[],
+            profiles=[],
+            llm=PlannerLLM(),
+            context_profile=DEFAULT_CONTEXT_PROFILE,
+        )
+
+        self.assertEqual(plan["planner_mode"], "llm")
+        self.assertFalse(plan["use_comment_fact_tool"])
+        self.assertFalse(plan["tool_only"])
+        self.assertTrue(plan["balanced_retrieval"])
+        self.assertIn("transcript_window", plan["doc_types"])
+        self.assertIn("top_comments", plan["doc_types"])
+        self.assertIn("comment_theme", plan["doc_types"])
+
+    def test_broad_comment_plan_does_not_force_exact_comment_tool(self):
+        class PlannerLLM(EchoPromptLLM):
+            def complete(self, prompt):
+                self.prompts.append(prompt)
+                return json.dumps(
+                    {
+                        "route": "comments",
+                        "needs_structured_metrics": False,
+                        "balanced_retrieval": False,
+                        "doc_types": ["top_comments", "comment_theme"],
+                        "use_comment_fact_tool": True,
+                        "tool_only": False,
+                        "reason": "test",
+                    }
+                )
+
+        plan = plan_question_with_llm(
+            question="Tell me about the least response time algorithm and also tell me about comments.",
+            history=[],
+            profiles=[],
+            llm=PlannerLLM(),
+            context_profile=DEFAULT_CONTEXT_PROFILE,
+        )
+
+        self.assertEqual(plan["route"], "comments")
+        self.assertFalse(plan["use_comment_fact_tool"])
+        self.assertFalse(plan["tool_only"])
+        self.assertTrue(plan["needs_structured_metrics"])
+        self.assertIn("transcript_text_window", plan["doc_types"])
+        self.assertIn("comment_intelligence_summary", plan["doc_types"])
 
     def test_memory_summary_is_loaded_and_updated_after_threshold(self):
         llm = EchoPromptLLM()
@@ -311,8 +404,61 @@ class ComparagRagGraphTests(unittest.TestCase):
         self.assertIn("Never use follower count as the denominator", prompt)
         self.assertIn("thumbnail: https://example.test/thumb.jpg", prompt)
         self.assertIn("creator_url: https://example.test/creator", prompt)
+        self.assertIn("Do not use outside/world knowledge", prompt)
+        self.assertIn("do not replace it with a generic explanation", prompt)
         self.assertIn("Put only one citation label inside each bracket", prompt)
-        self.assertIn("say it is unavailable", prompt)
+        self.assertIn("checked retrieved transcript, comment, and metadata evidence", prompt)
+        self.assertIn("not enough context", prompt)
+        self.assertIn("Final grounding checklist", prompt)
+        self.assertIn("Never answer a compound question with one blanket", prompt)
+        self.assertIn("closest retrieved evidence", prompt)
+        self.assertIn("answer the supported part with citations", prompt)
+
+    def test_format_retrieved_includes_transcript_variants_for_ambiguous_asr(self):
+        block = format_retrieved(
+            [
+                {
+                    "id": "demo_A_transcript_1",
+                    "text": "Video A transcript.\nThe route is from one city to another.",
+                    "metadata": {
+                        "doc_type": "transcript_window",
+                        "citation_label": "Video A, transcript 00:00-00:10",
+                        "hinglish_text": "route ek city se doosri city tak hai",
+                        "raw_text": "\u0930\u0942\u091f \u090f\u0915 \u0936\u0939\u0930 \u0938\u0947 \u0926\u0942\u0938\u0930\u0947 \u0936\u0939\u0930 \u0924\u0915 \u0939\u0948",
+                    },
+                }
+            ]
+        )
+
+        self.assertIn("Hinglish/raw-latin variant", block)
+        self.assertIn("Original ASR transcript", block)
+
+    def test_multi_part_questions_retrieve_each_subquestion(self):
+        retriever = FakeRetriever()
+        plan = {
+            "doc_types": ["full_transcript", "top_comments"],
+            "n_results": 4,
+            "balanced_retrieval": False,
+        }
+
+        retrieve_for_evidence_plan(
+            retriever=retriever,
+            comparison_id="demo",
+            question="Explain the algorithm? Also what distance is mentioned? Also summarize comments.",
+            evidence_plan=plan,
+        )
+
+        query_texts = [call["query_text"] for call in retriever.calls]
+        self.assertGreaterEqual(len(query_texts), 3)
+        self.assertIn("what distance is mentioned", [query.lower() for query in query_texts])
+        self.assertEqual(
+            retrieval_questions("Explain topic one? Also explain topic two? Also summarize comments.")[:3],
+            [
+                "Explain topic one? Also explain topic two? Also summarize comments.",
+                "Explain topic one",
+                "explain topic two",
+            ],
+        )
 
 
 if __name__ == "__main__":

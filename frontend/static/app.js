@@ -2,16 +2,18 @@ import { api, streamChat } from "./js/api.js";
 import { els, state } from "./js/state.js";
 import { renderJob, renderMessages, renderVideos, setStatus } from "./js/render.js";
 import { newComparisonId, stableKey, value } from "./js/utils.js";
-import { DEFAULT_COMMENT_LIMIT, EMBEDDING_HINTS, prepareJobForm } from "./js/validation.js";
+import { ASR_MODEL_HINTS, DEFAULT_COMMENT_LIMIT, EMBEDDING_HINTS, prepareJobForm } from "./js/validation.js";
 
 els.jobForm.addEventListener("submit", submitJob);
 els.freshComparison.addEventListener("click", resetWorkspace);
 els.chatForm.addEventListener("submit", submitChat);
 document.querySelector("#embeddingModel").addEventListener("change", updateEmbeddingHint);
+document.querySelector("#asrModel").addEventListener("change", updateAsrModelHint);
 
 checkApi();
 resetWorkspace();
 updateEmbeddingHint();
+updateAsrModelHint();
 
 async function checkApi() {
   try {
@@ -65,6 +67,7 @@ function readJobForm() {
     youtubeUrl: value("#youtubeUrl"),
     instagramUrl: value("#instagramUrl"),
     embeddingModel: value("#embeddingModel"),
+    asrModel: value("#asrModel"),
     maxComments: DEFAULT_COMMENT_LIMIT,
     requireTranscripts: true,
     commentIntelligence: "evidence",
@@ -77,7 +80,9 @@ function writeJobForm(form) {
   document.querySelector("#youtubeUrl").value = form.youtubeUrl;
   document.querySelector("#instagramUrl").value = form.instagramUrl;
   document.querySelector("#embeddingModel").value = form.embeddingModel;
+  document.querySelector("#asrModel").value = form.asrModel || "base";
   updateEmbeddingHint();
+  updateAsrModelHint();
 }
 
 function buildJobPayload(form) {
@@ -91,7 +96,7 @@ function buildJobPayload(form) {
       comment_time_budget_seconds: 60,
       instagrapi_settings: ".cache/instagrapi-session.json",
       asr_provider: "auto",
-      asr_model: "base",
+      asr_model: form.asrModel || "base",
       asr_timeout_seconds: 90,
       require_transcripts: form.requireTranscripts,
     },
@@ -107,6 +112,7 @@ function buildJobPayload(form) {
       ig: form.instagramUrl,
       comments: form.maxComments,
       embedding: form.embeddingModel,
+      asr: form.asrModel || "base",
     }),
   };
 }
@@ -114,6 +120,11 @@ function buildJobPayload(form) {
 function updateEmbeddingHint() {
   const model = value("#embeddingModel");
   els.embeddingHint.textContent = EMBEDDING_HINTS[model] || "";
+}
+
+function updateAsrModelHint() {
+  const model = value("#asrModel");
+  els.asrModelHint.textContent = ASR_MODEL_HINTS[model] || "";
 }
 
 function pollJob() {
@@ -129,7 +140,15 @@ function pollJob() {
         if (comparisonId) await setActiveComparison(comparisonId);
       }
     } catch (error) {
-      els.jobError.textContent = error.message;
+      if (String(error.message || "").startsWith("Unknown job:")) {
+        clearInterval(state.jobTimer);
+        state.job = null;
+        renderJob();
+        els.jobHint.textContent = "";
+        els.jobError.textContent = "That job no longer exists because the backend restarted. Start a new pipeline run.";
+        return;
+      }
+      els.jobHint.textContent = `Still running; status polling missed once (${error.message}). Retrying...`;
     }
   }, 1500);
 }
@@ -185,6 +204,7 @@ function resetWorkspace() {
     youtubeUrl: "",
     instagramUrl: "",
     embeddingModel: "quality",
+    asrModel: "base",
     maxComments: DEFAULT_COMMENT_LIMIT,
     requireTranscripts: true,
     commentIntelligence: "evidence",

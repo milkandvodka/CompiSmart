@@ -43,7 +43,13 @@ export default function App() {
           if (comparisonId) setActiveComparisonId(comparisonId);
         }
       } catch (error) {
-        setJobError(error.message);
+        if (String(error.message || "").startsWith("Unknown job:")) {
+          setJob(null);
+          setJobError("That job no longer exists because the backend restarted. Start a new pipeline run.");
+          setJobHint("");
+          return;
+        }
+        setJobHint(`Still running; status polling missed once (${error.message}). Retrying...`);
       }
     }, 1500);
     return () => clearInterval(timer);

@@ -4,6 +4,12 @@ export const EMBEDDING_HINTS = {
   fast: "MiniLM is the fastest option, useful for quick tests, but recall can be weaker.",
 };
 
+export const ASR_MODEL_HINTS = {
+  base: "Fastest local Whisper fallback. Use for quick checks; accuracy can be rough.",
+  small: "Better multilingual ASR than base, slower on CPU.",
+  medium: "Best local quality option here, but expect a long CPU run.",
+};
+
 export const DEFAULT_COMMENT_LIMIT = 100;
 
 export function prepareJobForm(form) {

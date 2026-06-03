@@ -46,6 +46,15 @@
                   </select>
                   <small id="embeddingHint" class="hint">BGE-M3 is slower but better for multilingual RAG quality.</small>
                 </label>
+                <label>
+                  Whisper Model
+                  <select id="asrModel">
+                    <option value="base">Base - fastest, rougher</option>
+                    <option value="small">Small - better, slower</option>
+                    <option value="medium">Medium - best local, slow</option>
+                  </select>
+                  <small id="asrModelHint" class="hint">Fastest local Whisper fallback. Use for quick checks; accuracy can be rough.</small>
+                </label>
               </div>
               <button id="runPipeline" type="submit">Run Pipeline</button>
             </form>

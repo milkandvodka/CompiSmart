@@ -91,13 +91,14 @@ class JobRegistry:
         try:
             result = fn(lambda stage, message, percent=None, details=None: self.progress(job_id, stage, message, percent, details))
         except Exception as exc:
+            error_message = format_job_error(exc)
             self._update(
                 job_id,
                 status="failed",
                 stage="failed",
-                message=f"{exc.__class__.__name__}: {exc}",
+                message=error_message,
                 percent=None,
-                error=f"{exc.__class__.__name__}: {exc}",
+                error=error_message,
             )
             return
         self._update(job_id, status="succeeded", stage="complete", message="Job complete.", percent=100.0, result=result)
@@ -150,6 +151,9 @@ class JobRegistry:
         if job is None:
             self._idempotency_index.pop((job_type, idempotency_key), None)
             return None
+        if job.status == "failed":
+            self._idempotency_index.pop((job_type, idempotency_key), None)
+            return None
         return job
 
 
@@ -169,6 +173,15 @@ def progress_record(
     if details:
         record["details"] = dict(details)
     return record
+
+
+def format_job_error(exc: Exception) -> str:
+    message = str(exc).strip()
+    if isinstance(exc, RuntimeError) and message:
+        return message
+    if message:
+        return f"{exc.__class__.__name__}: {message}"
+    return exc.__class__.__name__
 
 
 def utc_now() -> str:

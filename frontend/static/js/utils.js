@@ -42,3 +42,12 @@ export function thumbnailFallback(video) {
   }
   return "";
 }
+
+export function thumbnailProxyUrl(url) {
+  return url ? `/media/thumbnail?url=${encodeURIComponent(url)}` : "";
+}
+
+export function thumbnailImage(video) {
+  const raw = video?.thumbnail || thumbnailFallback(video);
+  return thumbnailProxyUrl(raw);
+}

@@ -125,6 +125,33 @@ class ComparagChunkingTests(unittest.TestCase):
 
         self.assertEqual(metadata, {"keep": "yes", "count": 2, "tags": "a, b"})
 
+    def test_build_chunks_skips_suspicious_short_asr_transcript(self):
+        payload = {
+            "videos": [
+                {
+                    "platform": "youtube",
+                    "id": "yt",
+                    "url": "https://youtube.test/short",
+                    "title": "Video A",
+                    "duration_seconds": 60,
+                    "transcript": {
+                        "available": True,
+                        "text": "tiny transcript",
+                        "kind": "asr",
+                        "engine": "huggingface-inference",
+                    },
+                }
+            ]
+        }
+
+        _, chunks = build_chunks(payload, "demo")
+        doc_types = {chunk.doc_type for chunk in chunks}
+
+        self.assertIn("video_fact_card", doc_types)
+        self.assertNotIn("full_transcript", doc_types)
+        self.assertNotIn("hook_0_5s", doc_types)
+        self.assertNotIn("transcript_text_window", doc_types)
+
 
 if __name__ == "__main__":
     unittest.main()

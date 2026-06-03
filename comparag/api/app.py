@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
+import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .jobs import JobRegistry
@@ -57,7 +59,7 @@ def create_app(
     async def rate_limit_middleware(request: Request, call_next):
         if not should_rate_limit(request):
             return await call_next(request)
-        limit = route_limit_for_path(request.url.path, request.app.state.rate_limits)
+        limit = route_limit_for_path(request.url.path, request.app.state.rate_limits, method=request.method)
         decision = request.app.state.rate_limiter.check(
             client_key(request),
             limit=limit.limit,
@@ -84,6 +86,29 @@ def create_app(
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/media/thumbnail")
+    def thumbnail_proxy(url: str) -> Response:
+        if not is_allowed_thumbnail_url(url):
+            raise HTTPException(status_code=400, detail="Unsupported thumbnail URL.")
+        try:
+            upstream = requests.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=502, detail="Thumbnail fetch failed.") from exc
+        if upstream.status_code >= 400:
+            raise HTTPException(status_code=upstream.status_code, detail="Thumbnail fetch failed.")
+        content_type = upstream.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if not content_type.startswith("image/"):
+            raise HTTPException(status_code=415, detail="Thumbnail URL did not return an image.")
+        return Response(
+            content=upstream.content,
+            media_type=content_type,
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
 
     @app.get("/comparisons", response_model=ComparisonListResponse)
     def list_comparisons(request: Request, app_dir: str | None = None) -> dict[str, Any]:
@@ -213,6 +238,23 @@ def request_fingerprint(namespace: str, payload, request: Request) -> str:
         payload=payload.model_dump(mode="json") if hasattr(payload, "model_dump") else payload,
         explicit_key=explicit,
     )
+
+
+def is_allowed_thumbnail_url(url: str) -> bool:
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower()
+    allowed_suffixes = (
+        "ytimg.com",
+        "youtube.com",
+        "googleusercontent.com",
+        "cdninstagram.com",
+        "fbcdn.net",
+        "fbsbx.com",
+        "instagram.com",
+    )
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in allowed_suffixes)
 
 
 app = create_app()

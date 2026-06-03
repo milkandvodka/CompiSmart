@@ -5,6 +5,7 @@ export const emptyJobForm = {
   youtubeUrl: "",
   instagramUrl: "",
   embeddingModel: "quality",
+  asrModel: "base",
   maxComments: 100,
   requireTranscripts: true,
   commentIntelligence: "evidence",
@@ -15,6 +16,12 @@ export const embeddingHints = {
   quality: "BGE-M3 is slower but better for multilingual RAG quality.",
   balanced: "E5 base is a middle path: decent multilingual retrieval with less latency.",
   fast: "MiniLM is the fastest option, useful for quick tests, but recall can be weaker.",
+};
+
+export const asrModelHints = {
+  base: "Fastest local Whisper fallback. Use for quick checks; accuracy can be rough.",
+  small: "Better multilingual ASR than base, slower on CPU.",
+  medium: "Best local quality option here, but expect a long CPU run.",
 };
 
 export function buildExtractIndexPayload(form) {
@@ -28,7 +35,7 @@ export function buildExtractIndexPayload(form) {
       comment_time_budget_seconds: 60,
       instagrapi_settings: ".cache/instagrapi-session.json",
       asr_provider: "auto",
-      asr_model: "base",
+      asr_model: form.asrModel || "base",
       asr_timeout_seconds: 90,
       require_transcripts: form.requireTranscripts,
     },

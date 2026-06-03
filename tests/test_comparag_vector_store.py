@@ -3,6 +3,7 @@ from unittest.mock import Mock
 
 from comparag.vector_store import ChromaChunkStore
 from comparag.vector_store import build_where_filter, unpack_query_result
+from comparag.models import RagChunk
 
 
 class ComparagVectorStoreTests(unittest.TestCase):
@@ -55,6 +56,27 @@ class ComparagVectorStoreTests(unittest.TestCase):
         store.upsert_chunks([])
 
         store.collection.upsert.assert_not_called()
+
+    def test_upsert_chunks_reports_batch_progress(self):
+        store = object.__new__(ChromaChunkStore)
+        store.collection = Mock()
+        chunks = [
+            RagChunk(
+                id=f"chunk_{index}",
+                comparison_id="demo",
+                video_id="A",
+                doc_type="full_transcript",
+                text="hello",
+                display_text="hello",
+                metadata={},
+            )
+            for index in range(3)
+        ]
+        progress = []
+
+        store.upsert_chunks(chunks, batch_size=2, progress=lambda done, total: progress.append((done, total)))
+
+        self.assertEqual(progress, [(2, 3), (3, 3)])
 
 
 if __name__ == "__main__":

@@ -1,3 +1,5 @@
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+
 export function stableIdempotencyKey(value) {
   return btoa(unescape(encodeURIComponent(JSON.stringify(value)))).slice(0, 96);
 }
@@ -22,4 +24,13 @@ export function thumbnailFallback(video) {
     return `https://i.ytimg.com/vi/${encodeURIComponent(video.source_id)}/hqdefault.jpg`;
   }
   return "";
+}
+
+export function thumbnailProxyUrl(url) {
+  return url ? `${API_BASE}/media/thumbnail?url=${encodeURIComponent(url)}` : "";
+}
+
+export function thumbnailImage(video) {
+  const raw = video?.thumbnail || thumbnailFallback(video);
+  return thumbnailProxyUrl(raw);
 }

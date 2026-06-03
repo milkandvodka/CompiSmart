@@ -1,5 +1,5 @@
 import { els, state } from "./state.js";
-import { clamp, escapeAttr, escapeHtml, metric, numberOrUnavailable, thumbnailFallback } from "./utils.js";
+import { clamp, escapeAttr, escapeHtml, metric, numberOrUnavailable, thumbnailFallback, thumbnailImage, thumbnailProxyUrl } from "./utils.js";
 
 export function renderVideos() {
   const videos = state.activeComparison?.videos || [];
@@ -11,8 +11,8 @@ export function renderVideos() {
   for (const video of videos) {
     const card = document.createElement("article");
     card.className = "video-card";
-    const fallback = thumbnailFallback(video);
-    const imageUrl = video.thumbnail || fallback;
+    const fallback = thumbnailProxyUrl(thumbnailFallback(video));
+    const imageUrl = thumbnailImage(video);
     card.innerHTML = `
       ${imageUrl ? `<img src="${escapeAttr(imageUrl)}" alt="" loading="lazy" data-fallback="${escapeAttr(fallback)}" />` : '<div class="thumbnail-missing">No thumbnail</div>'}
       <div class="video-body">
@@ -71,9 +71,45 @@ export function renderJob() {
       </div>
       <div class="bar"><span style="width:${percent}%"></span></div>
       <p>${escapeHtml(job.progress?.message || "Waiting for progress...")}</p>
+      ${renderJobDetails(job.progress?.details)}
+      ${renderJobEvents(job.progress_events || [])}
       <small>${escapeHtml(job.job_id)}${job.deduped ? " deduped" : ""}</small>
     </div>
   `;
+}
+
+function renderJobDetails(details) {
+  const items = Object.entries(details || {}).filter(([, value]) => value !== null && value !== undefined && value !== "");
+  if (!items.length) return "";
+  return `
+    <dl class="job-details">
+      ${items.slice(0, 8).map(([key, value]) => `
+        <div>
+          <dt>${escapeHtml(formatStage(key))}</dt>
+          <dd>${escapeHtml(value)}</dd>
+        </div>
+      `).join("")}
+    </dl>
+  `;
+}
+
+function renderJobEvents(events) {
+  const visible = [...events].slice(-8).reverse();
+  if (visible.length <= 1) return "";
+  return `
+    <ol class="job-events">
+      ${visible.map((event) => `
+        <li>
+          <span>${escapeHtml(formatStage(event.stage))}</span>
+          <small>${escapeHtml(event.message || "")}</small>
+        </li>
+      `).join("")}
+    </ol>
+  `;
+}
+
+function formatStage(value) {
+  return String(value || "").replaceAll("_", " ").replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
 export function renderMessages() {
@@ -100,15 +136,20 @@ export function setStatus(status) {
 function appendCitations(row, message) {
   const citations = message.result?.citations || [];
   if (citations.length) {
-    const chips = document.createElement("div");
-    chips.className = "chips";
-    chips.innerHTML = citations.slice(0, 8).map((citation) => `<span>${escapeHtml(citation.label)}</span>`).join("");
-    row.append(chips);
+    const details = document.createElement("details");
+    details.className = "source-details";
+    details.innerHTML = `
+      <summary>Sources (${citations.length})</summary>
+      <div class="chips">
+        ${citations.slice(0, 8).map((citation) => `<span>${escapeHtml(citation.label)}</span>`).join("")}
+      </div>
+    `;
+    row.append(details);
   }
-  if (message.result?.citation_audit) {
+  if (message.result?.citation_audit && !message.result.citation_audit.valid) {
     const audit = document.createElement("small");
-    audit.className = message.result.citation_audit.valid ? "ok" : "error";
-    audit.textContent = `citations ${message.result.citation_audit.valid ? "valid" : "need review"}`;
+    audit.className = "error";
+    audit.textContent = "citations need review";
     row.append(audit);
   }
 }

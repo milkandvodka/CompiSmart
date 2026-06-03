@@ -1,13 +1,14 @@
-import { formatNumber, thumbnailFallback } from "../format.js";
+import { formatNumber, thumbnailFallback, thumbnailImage, thumbnailProxyUrl } from "../format.js";
 import { Metric } from "./Metric.jsx";
 
 export function VideoCard({ video }) {
   const fallback = thumbnailFallback(video);
-  const imageUrl = video.thumbnail || fallback;
+  const fallbackUrl = thumbnailProxyUrl(fallback);
+  const imageUrl = thumbnailImage(video);
 
   function handleImageError(event) {
-    if (fallback && event.currentTarget.src !== fallback) {
-      event.currentTarget.src = fallback;
+    if (fallbackUrl && event.currentTarget.src !== fallbackUrl) {
+      event.currentTarget.src = fallbackUrl;
       return;
     }
     event.currentTarget.replaceWith(Object.assign(document.createElement("div"), {

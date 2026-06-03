@@ -5,6 +5,17 @@ Pull normalized transcript and metadata for exactly two required inputs:
 - one YouTube video URL
 - one Instagram Reel or post URL
 
+## Demo
+
+Watch the demo walkthrough of the app in action:
+
+<https://cdn.curtosis.xyz/2026-06-03%2011-11-54.mkv>
+
+The demo uses these two example videos end-to-end (extraction, normalization, indexing, and chat):
+
+- YouTube: <https://www.youtube.com/shorts/H5Is2X5QyH0>
+- Instagram Reel: <https://www.instagram.com/reels/DZFSP3kJbm4/>
+
 ## Setup
 
 ```powershell

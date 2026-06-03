@@ -15,6 +15,7 @@ export const els = {
   jobError: document.querySelector("#jobError"),
   jobHint: document.querySelector("#jobHint"),
   embeddingHint: document.querySelector("#embeddingHint"),
+  asrModelHint: document.querySelector("#asrModelHint"),
   jobBox: document.querySelector("#jobBox"),
   runPipeline: document.querySelector("#runPipeline"),
   videoCards: document.querySelector("#videoCards"),

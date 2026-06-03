@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .embeddings import DEFAULT_EMBEDDING_MODEL, LocalSentenceTransformerEmbedding
 from .models import RagChunk, RetrievedChunk
@@ -56,7 +56,14 @@ class ChromaChunkStore:
             if batch:
                 self.collection.delete(ids=batch)
 
-    def upsert_chunks(self, chunks: list[RagChunk], *, batch_size: int = 128) -> None:
+    def upsert_chunks(
+        self,
+        chunks: list[RagChunk],
+        *,
+        batch_size: int = 128,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> None:
+        total = len(chunks)
         for start in range(0, len(chunks), batch_size):
             batch = chunks[start:start + batch_size]
             if not batch:
@@ -66,6 +73,8 @@ class ChromaChunkStore:
                 documents=[chunk.text for chunk in batch],
                 metadatas=[chunk.chroma_metadata() for chunk in batch],
             )
+            if progress:
+                progress(min(start + len(batch), total), total)
 
     def query(
         self,

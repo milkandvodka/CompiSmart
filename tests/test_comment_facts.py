@@ -89,6 +89,14 @@ class CommentFactsTests(unittest.TestCase):
         self.assertEqual(result["tool"], "comment_top_comments")
         self.assertIn("https://www.instagram.com/buyer2/", result["answer_text"])
 
+    def test_query_who_wrote_top_liked_comment_uses_ranked_comment_facts(self):
+        result = query_comment_facts("Who wrote the top liked comment and what was the like count?", self.table)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["tool"], "comment_top_comments")
+        self.assertIn("@viewer", result["answer_text"])
+        self.assertIn("7 likes", result["answer_text"])
+
     def test_query_every_fetched_instagram_comment_uses_comment_facts(self):
         result = query_comment_facts(
             "For Instagram Video B only, list every fetched comment with username, profile URL, comment-like count, and text.",

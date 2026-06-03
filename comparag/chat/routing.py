@@ -71,6 +71,10 @@ Use structured metrics for exact views, likes, comments, engagement rate, creato
 Use the comment fact tool for exact comment objects, commenters, comment-like counts, author URLs, author IDs, exact phrase searches, and top fetched comments.
 Use vector retrieval for transcript meaning, hooks, creative features, audience themes, comparisons, and recommendations.
 Use balanced retrieval when comparing Video A and Video B.
+For multi-part questions, do not collapse the plan into only one subtopic. If the user asks about comments plus another topic,
+choose route "general", set needs_structured_metrics true, include transcript/comment/video_fact_card doc types, and keep
+tool_only false. Bare requests like "tell me about the comments" should use comment intelligence and top-comment chunks;
+reserve the comment fact tool for exact comment objects, usernames, IDs, profile URLs, exact phrases, or comment-like counts.
 
 Conversation memory:
 {format_memory(history, memory_summary=memory_summary, context_profile=context_profile)}
@@ -102,7 +106,9 @@ def sanitize_evidence_plan(data: dict[str, Any], *, question: str, history: list
         route = "general"
     fallback = fallback_evidence_plan_for_route(question, route, history)
     doc_types = [str(item) for item in data.get("doc_types") or [] if str(item) in ALLOWED_DOC_TYPES]
-    needs_comment_facts = route == "comments" and asks_for_comment_fact_tool(question, history)
+    needs_comment_facts = asks_for_comment_fact_tool(question, history)
+    planner_requested_comment_tool = bool(data.get("use_comment_fact_tool", fallback.get("use_comment_fact_tool", False)))
+    planner_requested_tool_only = bool(data.get("tool_only", fallback.get("tool_only", False)))
     plan = {
         **fallback,
         "route": route,
@@ -110,11 +116,30 @@ def sanitize_evidence_plan(data: dict[str, Any], *, question: str, history: list
         "balanced_retrieval": bool(data.get("balanced_retrieval", fallback.get("balanced_retrieval"))),
         "doc_types": doc_types or fallback.get("doc_types") or [],
         "reason": str(data.get("reason") or fallback.get("reason") or "LLM evidence plan."),
-        "use_comment_fact_tool": bool(data.get("use_comment_fact_tool", fallback.get("use_comment_fact_tool", False)))
-        or needs_comment_facts,
-        "tool_only": bool(data.get("tool_only", fallback.get("tool_only", False))) or needs_comment_facts,
+        "use_comment_fact_tool": planner_requested_comment_tool and needs_comment_facts,
+        "tool_only": planner_requested_tool_only and planner_requested_comment_tool and needs_comment_facts,
         "planner_mode": "llm",
     }
+    plan = expand_plan_for_entity_lookup(question, plan)
+    if route == "comments" and not plan["tool_only"]:
+        plan["needs_structured_metrics"] = True
+        if data.get("video_id") not in ("A", "B"):
+            plan["balanced_retrieval"] = True
+        plan["doc_types"] = merge_doc_types(
+            plan["doc_types"],
+            [
+                "top_comments",
+                "comment_intelligence_summary",
+                "comment_theme",
+                "comment_cluster",
+                "comment_noise_summary",
+                "video_fact_card",
+                "full_transcript",
+                "transcript_window",
+                "transcript_text_window",
+            ],
+        )
+        plan["n_results"] = max(int(plan.get("n_results") or 8), 12)
     video_id = data.get("video_id")
     if video_id in ("A", "B"):
         plan["video_id"] = video_id
@@ -129,6 +154,14 @@ def sanitize_evidence_plan(data: dict[str, Any], *, question: str, history: list
     return plan
 
 
+def merge_doc_types(primary: list[str], additions: list[str]) -> list[str]:
+    merged: list[str] = []
+    for item in [*primary, *additions]:
+        if item in ALLOWED_DOC_TYPES and item not in merged:
+            merged.append(item)
+    return merged
+
+
 def fallback_evidence_plan(
     question: str,
     history: list[Message] | None = None,
@@ -137,6 +170,7 @@ def fallback_evidence_plan(
 ) -> dict[str, Any]:
     route = fallback_route_question(question, history)
     plan = fallback_evidence_plan_for_route(question, route, history or [])
+    plan = expand_plan_for_entity_lookup(question, plan)
     plan["planner_mode"] = "fallback"
     if planner_error:
         plan["planner_error"] = planner_error
@@ -230,6 +264,55 @@ def asks_for_comment_fact_tool(question: str, history: list[Message] | None = No
     if any(term in text for term in ["user id", "profile url", "comment-like", "comment like", "total comment likes"]):
         return True
     return should_route_to_comments_from_history(text, history or [])
+
+
+def asks_for_entity_lookup(question: str) -> bool:
+    text = " ".join(str(question or "").lower().split())
+    if not text:
+        return False
+    patterns = [
+        r"\bwhat(?:'s| is| was)?\s+(?:the\s+)?name\s+of\b",
+        r"\bwhat(?:'s| is| was)?\s+(?:the\s+)?(?:series|movie|show|film|song|place|location|route|person|character)\s+name\b",
+        r"\bwhich\s+(?:series|movie|show|film|song|place|location|route|person|character)\b",
+        r"\bwho(?:'s| is| was| are)?\s+(?:the\s+)?(?:person|guy|man|woman|father|son|creator|speaker|character)\b",
+        r"\bwho(?:'s| is| was| are)?\s+\w+",
+    ]
+    if any(re.search(pattern, text) for pattern in patterns):
+        return True
+    return bool(re.search(r"\b(?:father|son|series|movie|show|film|character)\b", text) and re.search(r"\b(?:name|who|which)\b", text))
+
+
+def expand_plan_for_entity_lookup(question: str, plan: dict[str, Any]) -> dict[str, Any]:
+    if not asks_for_entity_lookup(question):
+        return plan
+    if plan.get("tool_only") and plan.get("use_comment_fact_tool"):
+        return plan
+    doc_types = merge_doc_types(
+        list(plan.get("doc_types") or []),
+        [
+            "full_transcript",
+            "transcript_window",
+            "transcript_text_window",
+            "top_comments",
+            "comment_intelligence_summary",
+            "comment_theme",
+            "comment_cluster",
+            "video_fact_card",
+        ],
+    )
+    expanded = {
+        **plan,
+        "needs_structured_metrics": True,
+        "doc_types": doc_types,
+        "use_comment_fact_tool": False,
+        "tool_only": False,
+        "reason": f"{plan.get('reason') or 'Evidence plan.'} Entity/name lookups also search comment evidence because names/titles may appear only in comments.",
+    }
+    if not expanded.get("video_id"):
+        expanded["balanced_retrieval"] = True
+        expanded["per_video"] = max(int(expanded.get("per_video") or 0), 5)
+    expanded["n_results"] = max(int(expanded.get("n_results") or 0), 12)
+    return expanded
 
 
 def fallback_evidence_plan_for_route(question: str, route: str, history: list[Message] | None = None) -> dict[str, Any]:

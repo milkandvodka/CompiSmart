@@ -27,16 +27,28 @@ You are an expert creator analytics assistant comparing exactly two social video
 
 Rules:
 - Answer the creator's question directly.
+- Use only the structured metrics, exact tool results, retrieved context, and conversation memory in this prompt. Do not use outside/world knowledge, map estimates, or generic textbook explanations.
+- If the user asks multiple things, answer each part in its own short section and do not drop subquestions.
 - Use structured metrics for exact numbers.
 - Engagement rate always means (likes + comments) / views * 100. Never use follower count as the denominator.
 - Use retrieved transcript/comment chunks for content claims.
+- For algorithm, hook, creative, and content questions, summarize the retrieved video evidence; do not replace it with a generic explanation.
+- Every factual answer section must be backed by an available citation label. If you cannot cite the claim, do not include it.
 - Cite claims with bracketed labels such as [Video A, transcript 00:00-00:05].
 - Put only one citation label inside each bracket. Use [Video A, source] [Video B, source], not one combined bracket.
 - Cite exact metrics and engagement-rate claims with metadata snapshot labels.
 - If the evidence is approximate, say so briefly.
 - Do not invent unavailable metrics.
-- If the requested fact is absent from structured metrics and retrieved context, say it is unavailable.
+- Do not mark a requested fact unavailable until you have checked retrieved transcript, comment, and metadata evidence.
+- If retrieved evidence is relevant but ASR/normalization looks ambiguous, say what the evidence says and clearly note the ambiguity.
+- Never answer a compound question with one blanket "not enough context" if any subpart has relevant evidence. Split the answer into available evidence and missing/ambiguous evidence.
+- If a requested name, place, route, or phrase is not present exactly, but retrieved evidence contains a close or possibly confused term, say "I do not see <requested term>; the closest retrieved evidence says <source wording>" and cite it.
+- If a requested event/action is absent but related transcript evidence is present, answer the related transcript evidence first, then say which exact event/action is not in the retrieved evidence.
+- If there is not enough relevant indexed evidence to answer a subquestion accurately, say "not enough context" only for that subquestion and name the missing evidence instead of guessing.
+- Preserve wording from evidence. Do not relabel, merge, or reinterpret separate facts into a cleaner answer than the source supports.
+- Do not dump citation labels as standalone lines; cite inline only where they support a claim.
 - Keep advice specific and actionable.
+- Avoid generic report-style headings unless the user asks for a report.
 
 Route: {route}
 
@@ -60,6 +72,13 @@ Available citation labels:
 
 User question:
 {state["question"]}
+
+Final grounding checklist:
+- Answer only with supplied evidence and available citation labels.
+- Before saying "not enough context", check retrieved transcript, comments, metadata, exact tool results, and memory.
+- If evidence is partial, answer the supported part with citations and mark only the unsupported part as "not enough context".
+- If evidence is ambiguous or the user's wording may be a typo/ASR mismatch, say what the evidence actually says and cite it; do not silently treat the mismatch as no evidence.
+- Do not include map estimates, textbook explanations, or uncited factual claims.
 """.strip()
     return fit_to_budget(prompt, context_profile.max_prompt_chars)
 
@@ -199,6 +218,7 @@ def format_retrieved(
     for chunk in chunks:
         label = chunk.get("metadata", {}).get("citation_label") or chunk.get("id")
         text = fit_to_budget(str(chunk.get("text") or ""), context_profile.max_retrieved_chunk_chars)
+        text = append_transcript_variants(text, chunk, context_profile)
         block = f"[{label}]\n{text}"
         if used_chars + len(block) > context_profile.max_retrieved_context_chars:
             remaining = context_profile.max_retrieved_context_chars - used_chars
@@ -208,3 +228,22 @@ def format_retrieved(
         blocks.append(block)
         used_chars += len(block)
     return "\n\n".join(blocks)
+
+
+def append_transcript_variants(text: str, chunk: dict[str, Any], context_profile: ModelContextProfile) -> str:
+    metadata = chunk.get("metadata") or {}
+    doc_type = str(metadata.get("doc_type") or chunk.get("doc_type") or "")
+    chunk_id = str(chunk.get("id") or "")
+    is_transcript_chunk = "transcript" in doc_type or "_transcript_" in chunk_id
+    if not is_transcript_chunk:
+        return text
+    additions = []
+    hinglish = str(metadata.get("hinglish_text") or "").strip()
+    raw = str(metadata.get("raw_text") or "").strip()
+    if hinglish and hinglish not in text:
+        additions.append("Hinglish/raw-latin variant: " + fit_to_budget(hinglish, 600))
+    if raw and raw not in text:
+        additions.append("Original ASR transcript: " + fit_to_budget(raw, 600))
+    if not additions:
+        return text
+    return fit_to_budget(text + "\n" + "\n".join(additions), context_profile.max_retrieved_chunk_chars + 1400)

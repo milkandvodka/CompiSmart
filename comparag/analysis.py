@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .analysis_llm import DEFAULT_ANALYSIS_MODEL
 from .comment_intelligence import analyze_comments
@@ -11,6 +11,9 @@ from .config import gemini_key_available
 from .creative_features import analyze_creative_features
 from .models import JsonDict, VideoProfile
 from .observability import ObservabilityLogger
+
+
+ProgressCallback = Callable[[str, str, float | None, dict[str, Any] | None], None]
 
 
 @dataclass(frozen=True)
@@ -29,6 +32,7 @@ def enrich_payload_with_analysis(
     previous_record: JsonDict | None,
     config: AnalysisConfig,
     logger: ObservabilityLogger | None = None,
+    progress: ProgressCallback | None = None,
 ) -> tuple[JsonDict, JsonDict]:
     enriched = copy.deepcopy(payload)
     videos = enriched.get("videos") or []
@@ -38,9 +42,19 @@ def enrich_payload_with_analysis(
     creative_results: dict[str, JsonDict] = {}
     fingerprints = {"comment_intelligence": {}, "creative_features": {}}
 
-    for profile, video in zip(profiles, videos):
+    total_videos = max(1, len(videos))
+    for video_index, (profile, video) in enumerate(zip(profiles, videos)):
         analysis = video.setdefault("analysis", {})
         comments = [comment for comment in video.get("public_comment_objects") or [] if isinstance(comment, dict)]
+        emit_analysis_progress(
+            progress,
+            video_index=video_index,
+            total_videos=total_videos,
+            substep=0,
+            stage="analysis_comment_intelligence",
+            message=f"Analyzing Video {profile.video_id} comments.",
+            details={"video_id": profile.video_id, "comment_count": len(comments), "mode": config.comment_intelligence},
+        )
         comment_start = time.perf_counter()
         comment_result = analyze_comments(
             comments,
@@ -68,7 +82,31 @@ def enrich_payload_with_analysis(
                 "warnings": comment_result.get("warnings"),
             },
         )
+        emit_analysis_progress(
+            progress,
+            video_index=video_index,
+            total_videos=total_videos,
+            substep=1,
+            stage="analysis_comment_intelligence_done",
+            message=f"Video {profile.video_id} comment intelligence ready.",
+            details={
+                "video_id": profile.video_id,
+                "llm_used": comment_result.get("llm_used"),
+                "cache_hit": comment_result.get("cache_hit"),
+                "clusters": comment_result.get("cluster_count"),
+                "evidence_pack_chars": comment_result.get("evidence_pack_chars"),
+            },
+        )
 
+        emit_analysis_progress(
+            progress,
+            video_index=video_index,
+            total_videos=total_videos,
+            substep=2,
+            stage="analysis_creative_features",
+            message=f"Analyzing Video {profile.video_id} transcript creative features.",
+            details={"video_id": profile.video_id, "mode": config.creative_features},
+        )
         creative_start = time.perf_counter()
         creative_result = analyze_creative_features(
             video,
@@ -89,6 +127,20 @@ def enrich_payload_with_analysis(
                 "cache_hit": creative_result.get("cache_hit"),
                 "available": creative_result.get("available"),
                 "warnings": creative_result.get("warnings"),
+            },
+        )
+        emit_analysis_progress(
+            progress,
+            video_index=video_index,
+            total_videos=total_videos,
+            substep=3,
+            stage="analysis_creative_features_done",
+            message=f"Video {profile.video_id} creative features ready.",
+            details={
+                "video_id": profile.video_id,
+                "llm_used": creative_result.get("llm_used"),
+                "cache_hit": creative_result.get("cache_hit"),
+                "available": creative_result.get("available"),
             },
         )
 
@@ -150,3 +202,21 @@ def log_stage(
             **payload,
         },
     )
+
+
+def emit_analysis_progress(
+    progress: ProgressCallback | None,
+    *,
+    video_index: int,
+    total_videos: int,
+    substep: int,
+    stage: str,
+    message: str,
+    details: JsonDict,
+) -> None:
+    if not progress:
+        return
+    total_steps = max(1, total_videos * 4)
+    completed_steps = min(total_steps, (video_index * 4) + substep)
+    percent = 18.0 + (17.0 * (completed_steps / total_steps))
+    progress(stage, message, percent, details)

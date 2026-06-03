@@ -1,15 +1,19 @@
 import json
+import os
 import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from comparag.api.app import create_app, encode_sse
-from comparag.api.jobs import JobRegistry
+from comparag.api.indexing import build_extractor_command
+from comparag.api.jobs import JobRegistry, format_job_error
 from comparag.api.rate_limit import RouteLimit
-from comparag.api.services import AgentService
+from comparag.api.services import AgentService, summarize_extractor_stderr
+from comparag.api.schemas import ExtractAndIndexRequest
 
 
 class FakeAgentService:
@@ -132,6 +136,57 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(html.status_code, 200)
         self.assertIn("compaRAG", html.text)
 
+    def test_thumbnail_proxy_rejects_unsupported_hosts(self):
+        client, _ = self.make_client()
+        response = client.get("/media/thumbnail", params={"url": "http://127.0.0.1/private.png"})
+
+        self.assertEqual(response.status_code, 400)
+
+    @patch("comparag.api.app.requests.get")
+    def test_thumbnail_proxy_fetches_allowed_image_host(self, get_mock):
+        class FakeResponse:
+            status_code = 200
+            content = b"image"
+            headers = {"content-type": "image/jpeg"}
+
+        get_mock.return_value = FakeResponse()
+        client, _ = self.make_client()
+        response = client.get("/media/thumbnail", params={"url": "https://scontent.cdninstagram.com/thumb.jpg"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"image")
+        self.assertEqual(response.headers["content-type"], "image/jpeg")
+
+    def test_extractor_stderr_summary_prefers_error_line_and_redacts(self):
+        stderr = "\n".join(
+            [
+                "Traceback (most recent call last):",
+                "  File \"/app/social_video_extractor.py\", line 1, in <module>",
+                "error: failed with key sk-proj-secretsecretsecretsecretsecret and token hf_secretsecretsecretsecretsecret",
+            ]
+        )
+
+        summary = summarize_extractor_stderr(stderr)
+
+        self.assertTrue(summary.startswith("error: failed"))
+        self.assertIn("[redacted-openai-key]", summary)
+        self.assertIn("[redacted-hf-token]", summary)
+
+    def test_extractor_command_uses_default_instagram_cookie_file(self):
+        with TemporaryDirectory() as tmp:
+            cookie_path = Path(tmp) / "instagram-cookies.txt"
+            cookie_path.write_text("cookies", encoding="utf-8")
+            request = ExtractAndIndexRequest(
+                comparison_id="demo",
+                youtube_url="https://www.youtube.com/shorts/fMXq_lMB1Jo",
+                instagram_url="https://www.instagram.com/reel/DZB9wNBzvLT/",
+            )
+            with patch.dict(os.environ, {"INSTAGRAM_COOKIES": str(cookie_path)}, clear=False):
+                command = build_extractor_command(request, Path(tmp) / "out.json")
+
+        self.assertIn("--cookies", command)
+        self.assertIn(str(cookie_path), command)
+
     def test_chat_endpoint_delegates_to_agent(self):
         client, service = self.make_client()
         response = client.post(
@@ -226,6 +281,32 @@ class ApiTests(unittest.TestCase):
         self.assertIn("stage", second.json()["progress"])
         self.assertEqual(len(service.chat_requests), 0)
 
+    def test_failed_idempotent_job_can_be_retried(self):
+        calls = {"count": 0}
+        jobs = JobRegistry(max_workers=1)
+
+        def failing_job(progress):
+            calls["count"] += 1
+            raise RuntimeError("boom")
+
+        first, first_deduped = jobs.submit("index", failing_job, idempotency_key="same")
+        for _ in range(20):
+            current = jobs.get(first.job_id)
+            if current and current.status == "failed":
+                break
+            time.sleep(0.05)
+
+        second, second_deduped = jobs.submit("index", failing_job, idempotency_key="same")
+
+        self.assertFalse(first_deduped)
+        self.assertFalse(second_deduped)
+        self.assertNotEqual(first.job_id, second.job_id)
+        self.assertGreaterEqual(calls["count"], 1)
+
+    def test_job_error_formatting_omits_runtimeerror_prefix(self):
+        self.assertEqual(format_job_error(RuntimeError("Extractor failed: error: blocked")), "Extractor failed: error: blocked")
+        self.assertEqual(format_job_error(ValueError("bad input")), "ValueError: bad input")
+
     def test_rate_limit_blocks_repeated_requests(self):
         service = FakeAgentService()
         app = create_app(
@@ -243,6 +324,35 @@ class ApiTests(unittest.TestCase):
         blocked = client.get("/comparisons")
         self.assertEqual(blocked.status_code, 429)
         self.assertIn("Retry-After", blocked.headers)
+
+    def test_job_status_polling_has_separate_rate_limit(self):
+        service = FakeAgentService()
+        app = create_app(
+            agent_service=service,
+            job_registry=JobRegistry(max_workers=1),
+            rate_limits={
+                "default": RouteLimit(limit=100, window_seconds=60),
+                "jobs": RouteLimit(limit=1, window_seconds=60),
+                "job_status": RouteLimit(limit=5, window_seconds=60),
+            },
+        )
+        client = TestClient(app)
+
+        created = client.post(
+            "/jobs/index",
+            json={"comparison_id": "demo", "payload": {"videos": []}, "options": {"comment_intelligence": "off"}},
+        )
+        self.assertEqual(created.status_code, 202)
+        blocked_create = client.post(
+            "/jobs/index",
+            json={"comparison_id": "other", "payload": {"videos": []}, "options": {"comment_intelligence": "off"}},
+        )
+        self.assertEqual(blocked_create.status_code, 429)
+
+        job_id = created.json()["job_id"]
+        for _ in range(4):
+            status = client.get(f"/jobs/{job_id}")
+            self.assertEqual(status.status_code, 200)
 
     def test_encode_sse_json_payload(self):
         encoded = encode_sse({"type": "token", "text": "hello"})

@@ -210,6 +210,60 @@ label {
   margin: 8px 0 4px;
 }
 
+.job-details {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 4px;
+  margin: 8px 0;
+  border-radius: 6px;
+  background: #f8fafc;
+  padding: 8px;
+}
+
+.job-details div {
+  display: grid;
+  grid-template-columns: minmax(90px, 0.7fr) minmax(0, 1.3fr);
+  gap: 8px;
+  font-size: 11px;
+}
+
+.job-details dt {
+  color: #64748b;
+  font-weight: 700;
+}
+
+.job-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+
+.job-events {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.job-events li {
+  border-left: 2px solid #cbd5e1;
+  padding-left: 8px;
+}
+
+.job-events span {
+  display: block;
+  color: #111827;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.job-events small {
+  display: block;
+  color: #64748b;
+  line-height: 1.35;
+}
+
 .cards {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -330,6 +384,14 @@ pre {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  margin-top: 8px;
+}
+
+.source-details summary {
+  cursor: pointer;
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
   margin-top: 8px;
 }
 

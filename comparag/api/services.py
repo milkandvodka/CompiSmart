@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -11,6 +12,7 @@ from ..storage import load_comparison_record
 from .indexing import (
     ProgressCallback,
     build_extractor_command,
+    emit_progress,
     index_payload,
     load_json_file,
     safe_job_filename,
@@ -19,6 +21,33 @@ from .indexing import (
 from .paths import comparison_summary, resolve_app_dir
 from .runtime import build_engine, engine_cache_key, resolve_chat_collection_name, resolve_chat_embedding_model
 from .schemas import AgentRuntimeOptions, ChatRequest, ExtractAndIndexRequest, IndexComparisonRequest
+
+
+def redact_sensitive_text(text: str) -> str:
+    redactions = [
+        (r"AIza[0-9A-Za-z_-]{20,}", "[redacted-google-key]"),
+        (r"sk-[0-9A-Za-z_-]{20,}", "[redacted-openai-key]"),
+        (r"hf_[0-9A-Za-z]{20,}", "[redacted-hf-token]"),
+        (r"eyJ[0-9A-Za-z_-]{20,}\.[0-9A-Za-z_-]{20,}\.[0-9A-Za-z_-]{20,}", "[redacted-jwt]"),
+    ]
+    redacted = text
+    for pattern, replacement in redactions:
+        redacted = re.sub(pattern, replacement, redacted)
+    return redacted
+
+
+def summarize_extractor_stderr(stderr: str) -> str:
+    text = redact_sensitive_text((stderr or "").strip())
+    if not text:
+        return "Extractor exited without an error message."
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if line.lower().startswith("error:"):
+            return line
+    for line in reversed(lines):
+        if "DownloadError:" in line:
+            return line.split("DownloadError:", 1)[-1].strip()
+    return text[-1200:]
 
 
 class AgentService:
@@ -92,9 +121,16 @@ class AgentService:
         emit_progress(
             progress,
             "extracting",
-            "Fetching metadata, comments, captions, and ASR transcript if needed.",
+            "Running extractor: fetching metadata, comments, captions, and ASR transcript if needed.",
             5.0,
-            {"comparison_id": request.comparison_id},
+            {
+                "comparison_id": request.comparison_id,
+                "fetch_comments": request.extraction.fetch_comments,
+                "max_comments": request.extraction.max_comments,
+                "comment_time_budget_seconds": request.extraction.comment_time_budget_seconds,
+                "asr_provider": request.extraction.asr_provider,
+                "asr_model": request.extraction.asr_model,
+            },
         )
         completed = subprocess.run(
             command,
@@ -105,7 +141,10 @@ class AgentService:
             timeout=max(float(request.extraction.asr_timeout_seconds) + 180.0, 300.0),
         )
         if completed.returncode != 0:
-            raise RuntimeError(f"Extractor failed: {completed.stderr.strip()[-2000:]}")
+            error_summary = summarize_extractor_stderr(completed.stderr)
+            if error_summary.lower().startswith("error:"):
+                error_summary = error_summary.split(":", 1)[1].strip()
+            raise RuntimeError(f"Extractor failed: {error_summary}")
         emit_progress(
             progress,
             "transcribing",
