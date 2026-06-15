@@ -1,70 +1,265 @@
-# Social Video Extractor
+# compaRAG
 
-Pull normalized transcript and metadata for exactly two required inputs:
+compaRAG compares one YouTube Short and one Instagram Reel, extracts as much public video intelligence as possible, indexes it locally, and lets a creator ask cited RAG questions about performance, hooks, comments, audience reaction, metadata, and improvement ideas.
 
-- one YouTube video URL
-- one Instagram Reel or post URL
+Demo walkthrough:
 
-## Demo
-
-Watch the full demo walkthrough showing extraction, transcript normalization, indexing, and chat-based comparison:
-
-[![Watch Demo](https://img.youtube.com/vi/mmI3pI3-AGE/maxresdefault.jpg)](https://youtu.be/mmI3pI3-AGE)
-
+[![Watch Demo](https://img.youtube.com/vi/mmI3pI3-AGE/maxresdefault.jpg)](https://youtu.be/mmI3pI3-AGE) 
 **Video:** [watch demo](https://youtu.be/mmI3pI3-AGE)
 
-The demo uses these two example videos end-to-end (extraction, normalization, indexing, and chat):
+Example inputs used during development:
 
-* [YouTube Example](https://www.youtube.com/shorts/H5Is2X5QyH0)
-* [Instagram Example](https://www.instagram.com/reels/DZFSP3kJbm4/)
+- YouTube: <https://www.youtube.com/shorts/H5Is2X5QyH0>
+- Instagram: <https://www.instagram.com/reels/DZFSP3kJbm4/>
 
-## Setup
+## What It Does
+
+- Accepts exactly two URLs: one YouTube video/Short and one Instagram Reel/Post.
+- Extracts transcript, metadata, creator name, creator follower/subscriber count when exposed, views, likes, comments, hashtags, upload date, duration, thumbnails, and media format metadata.
+- Computes engagement rate as `(likes + comments) / views * 100`.
+- Fetches top public comments with usernames, comment IDs, profile URLs when available, like counts, and reply counts.
+- Falls back from platform captions to ASR when transcripts are missing. The UI exposes local Whisper quality choices: `base`, `small`, and `medium`.
+- Normalizes non-English or mixed-language transcripts into raw text, Latin/Hinglish text, and English-normalized text for better RAG retrieval.
+- Builds local Chroma vector indexes plus BM25 lexical indexes, so semantic meaning and exact wording both matter.
+- Uses LangGraph orchestration for evidence planning, retrieval, tool evidence, LLM answer generation, citation validation, and memory.
+- Streams chat answers with source citations and keeps short-term plus optional Supabase-backed long-term memory.
+- Ships with a FastAPI backend, Docker setup, and a lightweight React/Vite frontend.
+
+## Architecture
+
+```text
+URLs
+  -> extractor: metadata, comments, thumbnails, captions, ASR fallback
+  -> transcript normalizer: raw + Hinglish/Latin + English-normalized variants
+  -> analysis layer: compressed comment intelligence + transcript creative features
+  -> chunker: transcript windows, hook chunks, metric records, comment chunks
+  -> indexes: Chroma vectors + BM25 lexical index + exact comment facts
+  -> LangGraph chat: plan evidence, retrieve, call tools, answer, validate citations
+  -> UI: side-by-side video cards + streaming chat
+```
+
+Core stack:
+
+- Backend: FastAPI, LangGraph, ChromaDB, local BM25, yt-dlp, Instagrapi/Instaloader, faster-whisper
+- Frontend: React, Vite
+- Embeddings: local transformer models through `transformers`
+- LLM routing: Gemini Flash Lite by default, OpenAI fallback, retrieval fallback for failure cases
+- Memory: local in-process memory by default, optional Supabase persistence
+
+## Quick Start
+
+### 1. Create Local Env
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Fill only the values you need. Do not commit `.env`, cookies, session files, or cache directories.
+
+Minimum useful local setup:
+
+```env
+GEMINI_API_KEY=
+OPENAI_API_KEY=
+HF_TOKEN=
+
+INSTAGRAM_SESSIONID=
+INSTAGRAM_COOKIES=.cache/instagram-cookies.txt
+
+COMPARAG_LLM_MODE=auto
+COMPARAG_DISABLE_GEMINI=0
+```
+
+Notes:
+
+- `OPENAI_API_KEY` is used as an LLM fallback when Gemini fails or is disabled.
+- `HF_TOKEN` helps hosted Whisper/ASR access when configured.
+- Instagram may require a real logged-in browser cookie/session for some public Reels.
+- The Docker compose file currently disables Gemini for local testing with `COMPARAG_DISABLE_GEMINI=1`; remove or override that when you want Gemini first.
+
+### 2. Run Backend With Docker
+
+```powershell
+docker compose build api
+docker compose up -d --force-recreate api
+```
+
+Backend:
+
+- Health: <http://127.0.0.1:8001/health>
+- API docs: <http://127.0.0.1:8001/docs>
+- Static fallback UI: <http://127.0.0.1:8001/ui/static/index.html>
+
+The container mounts local `.cache` into `/app/.cache`, so Chroma data, model caches, Instagram session settings, and extractor outputs survive container restarts.
+
+### 3. Run Frontend Locally
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open:
+
+<http://127.0.0.1:5173/>
+
+For local Docker backend testing, `frontend/.env.local` should contain:
+
+```env
+VITE_API_BASE_URL=http://127.0.0.1:8001
+```
+
+The frontend starts fresh by default. Paste one YouTube URL and one Instagram URL, choose the embedding and Whisper presets, run the pipeline, then ask questions in the chat panel.
+
+## Vercel Frontend Deploy
+
+This repo is a monorepo. Deploy only the Vite app inside `frontend`.
+
+In the Vercel dashboard:
+
+- Import the GitHub repo.
+- Set Root Directory to `frontend`.
+- Set Framework Preset to `Vite`.
+- Set Install Command to `npm install`.
+- Set Build Command to `npm run build`.
+- Set Output Directory to `dist`.
+- Add environment variable `VITE_API_BASE_URL=https://YOUR_BACKEND_DOMAIN`.
+
+The frontend already includes [frontend/vercel.json](frontend/vercel.json) for SPA fallback routing and the `dist` output directory.
+
+Important production note: a Vercel-hosted frontend cannot call `http://127.0.0.1:8001` for real users. `127.0.0.1` means the visitor's own machine, not your laptop. For production, host the FastAPI backend on a public HTTPS URL and set `VITE_API_BASE_URL` to that URL. For temporary demos, a tunnel such as ngrok or Cloudflare Tunnel can expose your local backend.
+
+CLI deploy option:
+
+```powershell
+cd frontend
+npm install
+npx vercel
+npx vercel --prod
+```
+
+## Backend API
+
+Useful endpoints:
+
+- `GET /health`
+- `GET /comparisons`
+- `GET /comparisons/{comparison_id}`
+- `POST /jobs/extract-index`
+- `POST /jobs/index`
+- `GET /jobs/{job_id}`
+- `POST /chat`
+- `POST /chat/stream`
+
+`POST /jobs/extract-index` is the main UI path. It extracts both videos, normalizes transcripts, analyzes comments/features, chunks, embeds, writes Chroma/BM25 indexes, and stores the comparison record.
+
+Example payload:
+
+```json
+{
+  "comparison_id": "demo_pair",
+  "youtube_url": "https://www.youtube.com/shorts/VIDEO_ID",
+  "instagram_url": "https://www.instagram.com/reel/REEL_ID/",
+  "extraction": {
+    "fetch_comments": true,
+    "max_comments": 100,
+    "comment_time_budget_seconds": 60,
+    "asr_provider": "auto",
+    "asr_model": "base",
+    "require_transcripts": true
+  },
+  "index": {
+    "embedding_model": "quality",
+    "allow_embedding_download": true,
+    "comment_intelligence": "evidence",
+    "creative_features": "evidence"
+  }
+}
+```
+
+Job status responses include `progress` and `progress_events`, so the UI can show stages such as `extracting`, `transcribing`, `analysis`, `chunking`, `embedding`, `lexical_index`, and `complete`.
+
+The backend has lightweight local protection:
+
+- rate limits per client/path
+- idempotent duplicate job submissions by payload or `Idempotency-Key`
+- duplicate chat request caching
+- safe replay behavior for completed streaming responses
+
+## CLI Usage
+
+Install Python dependencies:
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-## Usage
-
-Named inputs:
+Extract both videos:
 
 ```powershell
 python social_video_extractor.py `
-  --youtube-url "https://www.youtube.com/watch?v=VIDEO_ID" `
+  --youtube-url "https://www.youtube.com/shorts/VIDEO_ID" `
   --instagram-url "https://www.instagram.com/reel/REEL_ID/" `
-  --include-raw `
   --fetch-comments `
+  --max-comments 100 `
+  --asr-provider auto `
+  --asr-model base `
   --output result.json
 ```
 
-Positional inputs also work in either order:
+Normalize transcripts:
 
 ```powershell
-python social_video_extractor.py "https://www.instagram.com/p/POST_ID/" "https://youtu.be/VIDEO_ID"
+python transcript_normalizer.py `
+  --input result.json `
+  --output result.normalized.json `
+  --model gemini-2.5-flash-lite
 ```
 
-The output contains these normalized fields for both videos:
+Build the local RAG index:
 
-- transcript text and timestamped segments
-- ASR transcript fallback when platform captions are unavailable
-- views
-- likes
-- comments
-- creator
-- follower count, when exposed by the platform
-- hashtags
-- upload date
-- duration
-- primary thumbnail URL and all thumbnail URLs
-- media format URLs and technical format metadata
+```powershell
+python -m comparag index `
+  --input result.normalized.json `
+  --comparison-id demo_pair `
+  --embedding-model quality `
+  --comment-intelligence evidence `
+  --creative-features evidence `
+  --chroma-dir .cache\chroma `
+  --app-dir .cache\comparag `
+  --allow-embedding-download
+```
 
-## Authenticated Extraction
+Ask a cited RAG question:
 
-Instagram metadata and captions are often unavailable without a logged-in browser session. Use one of these when public extraction fails:
+```powershell
+python -m comparag chat `
+  --comparison-id demo_pair `
+  --question "Compare the hooks and tell me why Video A got more engagement" `
+  --retrieval-mode hybrid `
+  --llm auto
+```
+
+Embedding presets:
+
+- `fast`: `sentence-transformers/all-MiniLM-L6-v2`
+- `balanced`: `intfloat/multilingual-e5-base`
+- `quality`: `BAAI/bge-m3`
+
+Retrieval modes:
+
+- `semantic`: Chroma vector retrieval
+- `lexical`: BM25 exact-word retrieval
+- `hybrid`: semantic + lexical reciprocal-rank fusion
+
+## Instagram Auth
+
+Instagram often blocks anonymous metadata, thumbnails, captions, or comments even for public content. Supported auth paths:
 
 ```powershell
 python social_video_extractor.py `
-  --youtube-url "https://www.youtube.com/watch?v=VIDEO_ID" `
+  --youtube-url "https://www.youtube.com/shorts/VIDEO_ID" `
   --instagram-url "https://www.instagram.com/reel/REEL_ID/" `
   --cookies-from-browser chrome
 ```
@@ -73,275 +268,109 @@ or:
 
 ```powershell
 python social_video_extractor.py `
-  --youtube-url "https://www.youtube.com/watch?v=VIDEO_ID" `
+  --youtube-url "https://www.youtube.com/shorts/VIDEO_ID" `
   --instagram-url "https://www.instagram.com/reel/REEL_ID/" `
-  --cookies "cookies.txt"
+  --cookies ".cache/instagram-cookies.txt"
 ```
 
-Use `--require-transcripts` if the run should fail whenever either platform does not expose a readable caption track.
-
-Use `--fetch-comments` with `--include-raw` when you want public comment objects, not only comment counts.
-
-Instagram can expose more fields through the Instaloader supplement, including `video_view_count` and
-profile `followers` when public requests are allowed. If anonymous Instagram GraphQL calls are limited,
-create/load an Instaloader session and pass:
+or reuse an Instagrapi settings file:
 
 ```powershell
 python social_video_extractor.py `
-  --youtube-url "https://www.youtube.com/watch?v=VIDEO_ID" `
-  --instagram-url "https://www.instagram.com/p/POST_ID/" `
-  --instaloader-session-user "YOUR_INSTAGRAM_USERNAME"
-```
-
-Full Instagram comment pagination with per-comment like counts usually requires authenticated Instagram
-API access. The extractor supports Instagrapi for that:
-
-```powershell
-python social_video_extractor.py `
-  --youtube-url "https://www.youtube.com/watch?v=VIDEO_ID" `
-  --instagram-url "https://www.instagram.com/p/POST_ID/" `
+  --youtube-url "https://www.youtube.com/shorts/VIDEO_ID" `
+  --instagram-url "https://www.instagram.com/reel/REEL_ID/" `
   --fetch-comments `
-  --fetch-comment-replies `
-  --max-comments 0 `
-  --instagram-username "YOUR_INSTAGRAM_USERNAME" `
-  --instagram-password "YOUR_INSTAGRAM_PASSWORD" `
   --instagrapi-settings ".cache/instagrapi-session.json"
 ```
 
-After the first successful login, reuse the saved settings file:
+If Instagram returns `challenge_required`, approve the login/checkpoint in Instagram first, then retry. The app will report that as an extraction/auth issue instead of pretending the post has no data.
 
-```powershell
-python social_video_extractor.py `
-  --youtube-url "https://www.youtube.com/watch?v=VIDEO_ID" `
-  --instagram-url "https://www.instagram.com/p/POST_ID/" `
-  --fetch-comments `
-  --fetch-comment-replies `
-  --max-comments 0 `
-  --instagrapi-settings ".cache/instagrapi-session.json"
-```
+## Environment Variables
 
-You can also pass `--instagram-sessionid "SESSION_ID"` if you explicitly provide a session ID.
+Backend variables:
 
-For higher-quality fallback transcription, use a larger faster-whisper model:
+| Variable | Purpose |
+| --- | --- |
+| `GEMINI_API_KEY` | Gemini model calls for normalization, analysis, and chat |
+| `OPENAI_API_KEY` | OpenAI fallback model calls |
+| `HF_TOKEN` | Hugging Face-hosted ASR/model access |
+| `INSTAGRAM_USERNAME` / `INSTAGRAM_PASSWORD` | Optional Instagrapi login |
+| `INSTAGRAM_SESSIONID` | Optional logged-in Instagram session ID |
+| `INSTAGRAM_COOKIES` | Optional cookie file path |
+| `COMPARAG_LLM_MODE` | `auto`, `gemini`, `openai`, `fallback`, or `codex_testing` |
+| `COMPARAG_DISABLE_GEMINI` | Set `1` to skip Gemini during local testing |
+| `SUPABASE_URL` | Optional Supabase project URL for persistent memory |
+| `SUPABASE_SERVICE_ROLE_KEY` | Optional Supabase service role key |
+| `SUPABASE_DB_URL` | Optional direct Postgres URL |
 
-```powershell
-python social_video_extractor.py `
-  --youtube-url "https://www.youtube.com/watch?v=VIDEO_ID" `
-  --instagram-url "https://www.instagram.com/p/POST_ID/" `
-  --asr-model small `
-  --require-transcripts
-```
+Frontend variables:
 
-## Transcript Normalization
+| Variable | Purpose |
+| --- | --- |
+| `VITE_API_BASE_URL` | Public base URL for the FastAPI backend |
 
-Keep the raw ASR transcript, then add Latin-script Hinglish and normalized English variants for RAG:
-
-```powershell
-$env:GEMINI_API_KEY = "YOUR_GEMINI_API_KEY"
-python transcript_normalizer.py `
-  --input result.json `
-  --output result.normalized.json `
-  --model gemini-2.5-flash-lite
-```
-
-The same Gemini key is used by transcript normalization, index-time analysis, and chat. You can provide it with
-`GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_API_KEY`, `GEMINI_KEY`, or a local ignored `.env` file.
-
-The normalizer checks for non-English scripts first. English-only transcripts skip the Gemini call and cost nothing.
-
-For local QA only, you can bypass Gemini chat generation and use the installed Codex CLI as a stateless test provider:
-
-```powershell
-COMPARAG_LLM_MODE=codex_testing
-```
-
-`codex_testing` runs `codex exec` in an empty temporary workspace and passes only the RAG prompt through stdin.
-Remove that env setting when you want production behavior to return to Gemini.
-
-Even when exact tools gather metrics or comment lookups, the normal chat path still calls the configured LLM. Tool
-results are supplied as evidence/context; they are not used as the final conversational answer. If the LLM provider
-fails, the app returns a generation-failure message with the prepared evidence instead of fabricating an answer.
-
-## Local RAG Index
-
-Build the local Chroma index after extraction and transcript normalization:
-
-```powershell
-python -m comparag index `
-  --input result.normalized.json `
-  --comparison-id demo_run `
-  --embedding-model balanced `
-  --comment-intelligence llm `
-  --creative-features llm `
-  --analysis-model gemini-2.5-flash-lite `
-  --chroma-dir .cache\chroma `
-  --app-dir .cache\comparag `
-  --allow-embedding-download
-```
-
-Use `--allow-embedding-download` only the first time a free local embedding model needs to be cached.
-Embedding presets:
-
-- `fast`: `sentence-transformers/all-MiniLM-L6-v2`
-- `balanced`: `intfloat/multilingual-e5-base`
-- `quality`: `BAAI/bge-m3`
-
-The index command also writes a local BM25 lexical index beside Chroma, so exact wording and semantic meaning are both available.
-It also builds cached comment intelligence and transcript-only creative features before chunking. If no Gemini key is
-available, those analysis stages store compressed evidence only and record warnings; semantic themes and creative
-features require an LLM call.
-Repeated indexing is incremental: unchanged chunk fingerprints skip Chroma and embedding work. Use `--force-reindex`
-when you intentionally want to rebuild every vector.
-
-Indexing also stores a structured `comment_facts` table beside vector chunks. Exact comment analytics such as
-commenter usernames, user IDs, profile URLs, comment-like sums, and phrase counts are exposed to the LLM as tool
-evidence, so exact phrase questions do not depend on semantic search.
-
-Ask questions with the LangGraph chat orchestrator:
-
-```powershell
-python -m comparag chat `
-  --comparison-id demo_run `
-  --question "Compare the hooks in the first 5 seconds" `
-  --retrieval-mode hybrid `
-  --llm gemini
-```
-
-Retrieval modes:
-
-- `semantic`: Chroma vector search only
-- `lexical`: BM25 exact-word retrieval only
-- `hybrid`: semantic + lexical reciprocal-rank fusion
-
-For offline debugging without an LLM call:
-
-```powershell
-python -m comparag chat `
-  --comparison-id demo_run `
-  --question "What's the engagement rate of each?" `
-  --llm fallback `
-  --no-stream
-```
-
-Enable local reranking when you want higher precision over the fused candidates:
-
-```powershell
-python -m comparag chat `
-  --comparison-id demo_run `
-  --question "Suggest improvements for B based on what worked in A" `
-  --retrieval-mode hybrid `
-  --enable-reranker `
-  --reranker-model quality `
-  --allow-reranker-download
-```
-
-The RAG layer stores exact metrics separately from semantic chunks. Metrics and creator questions answer from
-structured data; hook/comparison/improvement questions retrieve balanced chunks from Video A and Video B.
-Context budgets are model-aware through provider profiles for Gemini, Codex test mode, OpenAI-style models, and
-smaller models. Recent history, exact tool output, retrieved context, per-chunk text, and the final prompt are all
-capped before the LLM call.
-
-## FastAPI Backend
-
-Run the backend around the same agent used by the CLI:
-
-```powershell
-python -m uvicorn comparag.api.app:app --host 127.0.0.1 --port 8000
-```
-
-Useful local endpoints:
-
-- `GET /health`
-- `GET /comparisons`
-- `GET /comparisons/{comparison_id}`
-- `POST /chat`
-- `POST /chat/stream` for server-sent token events
-- `POST /jobs/index` for background indexing from an extractor JSON path or payload
-- `POST /jobs/extract-index` for background URL extraction plus indexing
-- `GET /jobs/{job_id}`
-
-OpenAPI docs are available at `http://127.0.0.1:8000/docs`.
-The lightweight UI is served by the same backend at `http://127.0.0.1:8000/ui`.
-
-Job responses include a `progress` object and `progress_events` history so the UI can poll `GET /jobs/{job_id}` and
-show stages such as `extracting`, `transcribing`, `analysis`, `chunking`, `embedding`, `lexical_index`, and `complete`.
-
-The backend has lightweight in-memory API protection:
-
-- rate limits are applied per client/path, with stricter limits on `/chat` and `/jobs`
-- duplicate job submissions are idempotent by payload or `Idempotency-Key`
-- duplicate `/chat` requests in a short window return the cached answer instead of appending another memory turn
-- duplicate `/chat/stream` requests replay the completed stream when available or return a duplicate event while one is already in progress
-
-## Docker
-
-Build and run the backend container:
-
-```powershell
-docker compose build api
-docker compose up -d api
-```
-
-The compose service exposes the container on `http://127.0.0.1:8001` and serves the static UI at
-`http://127.0.0.1:8001/ui/static/index.html`.
-It mounts local `.cache` into `/app/.cache`, including Chroma data, Instagram session settings, and Hugging Face model
-cache files used by local embeddings.
-Secrets stay in the local ignored `.env` file and are loaded at runtime, not baked into the image.
-Compose sets `COMPARAG_LLM_MODE=auto` and `COMPARAG_DISABLE_GEMINI=1` for local testing, because Gemini can hang or
-quota out during development. With the provided local `.env`, Docker uses OpenAI first, then retrieval fallback.
-For production, remove `COMPARAG_DISABLE_GEMINI=1` if you want auto mode to try Gemini before OpenAI.
-For local responsiveness, Compose also sets `GEMINI_TIMEOUT_SECONDS=10` and `GEMINI_MAX_RETRIES=0`; raise those values
-later if the hosted backend has stable outbound model latency.
-
-## UI
-
-The frontend lives in [frontend](./frontend). The React/Vite app is scaffolded for the final UI:
-
-```powershell
-cd frontend
-npm install
-npm run dev
-```
-
-For Docker-backed local testing, create `frontend/.env.local` with:
-
-```powershell
-VITE_API_BASE_URL=http://127.0.0.1:8001
-```
-
-The currently running local frontend is expected at `http://127.0.0.1:5173`.
-
-The UI opens in a fresh state by default. The visible job form asks only for a comparison ID, one YouTube URL, one
-Instagram URL, and the embedding quality preset. If the YouTube and Instagram URLs are pasted into the wrong fields,
-the UI swaps them before submission and shows a short message. Comment collection, transcript enforcement, and analysis
-modes are handled by backend defaults so the form stays usable.
-
-
-
-## Code Structure
-
-Backend orchestration is split by responsibility:
-
-- `comparag/api`: FastAPI routes, job registry, API protection, runtime wiring, indexing service helpers
-- `comparag/chat`: LangGraph chat engine, evidence planning, retrieval routing, prompt building, citation validation
-- `comparag/chunks`: transcript/comment/analysis chunk builders
-- `comparag/comment_tools`: exact comment fact table, phrase parsing, comment lookup tools, citation formatting
+Only variables prefixed with `VITE_` are exposed to the Vite browser bundle. Keep backend secrets out of `frontend/.env.local` and Vercel frontend env unless they are meant to be public.
 
 ## Persistent Memory
 
-Local chat memory is in-process by default. To use Supabase-backed persistent memory, set:
+Local memory works out of the box for a running process. To persist chat memory in Supabase, set:
 
-```powershell
-SUPABASE_URL="https://YOUR_PROJECT.supabase.co"
-SUPABASE_SERVICE_ROLE_KEY="YOUR_SERVICE_ROLE_KEY"
+```env
+SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY
 ```
 
-Then create the memory tables by running [001_comparag_memory.sql](./supabase/migrations/001_comparag_memory.sql)
-in the Supabase SQL editor. The app only performs read/write/upsert operations at runtime; it does not delete tables.
+Then run [supabase/migrations/001_comparag_memory.sql](supabase/migrations/001_comparag_memory.sql) in the Supabase SQL editor.
 
-Chat uses `--memory-backend auto` by default. Auto uses Supabase when configured and falls back to local memory if
-the tables are not created yet. Use `--memory-backend supabase` when you want missing-table errors to fail loudly.
+The app only reads, writes, and upserts records in the tables it owns. It does not drop or delete your existing tables.
 
-For long chats, the engine keeps recent turns plus a rolling long-term summary. The summary is updated by the
-configured LLM after enough new messages accumulate, stored in `comparag_memory_summaries`, and read back into both
-the evidence planner and final answer prompt. If no LLM provider is configured, summaries are not guessed.
+Long chats use recent messages plus a rolling summary. If no LLM provider is available, the summary is not guessed.
+
+## Tests
+
+Python test suite:
+
+```powershell
+python -m unittest discover -s tests
+```
+
+Frontend build:
+
+```powershell
+cd frontend
+npm run build
+```
+
+## Repo Structure
+
+```text
+comparag/
+  api/             FastAPI app, schemas, job registry, rate limits, runtime wiring
+  chat/            LangGraph orchestration, planning, retrieval routing, prompts
+  chunks/          Transcript, comment, metric, and analysis chunk builders
+  comment_tools/   Exact comment facts, phrase lookup, user/profile evidence
+  memory/          Local and Supabase memory backends
+frontend/
+  src/             React/Vite frontend
+  static/          Static UI served directly by FastAPI
+scripts/           Utility scripts
+supabase/          SQL migrations
+tests/             Unit tests
+```
+
+Top-level entry points:
+
+- [social_video_extractor.py](social_video_extractor.py): extractor CLI
+- [transcript_normalizer.py](transcript_normalizer.py): transcript variant generation
+- [comparag/cli.py](comparag/cli.py): index/chat CLI
+- [comparag/api/app.py](comparag/api/app.py): FastAPI app
+- [frontend/src/App.jsx](frontend/src/App.jsx): Vite app shell
+
+## Known Limits
+
+- Instagram can require a valid logged-in session even for public Reels.
+- Comment pagination speed depends on platform throttling and auth state.
+- Local Whisper `medium` is noticeably slower on CPU.
+- First embedding run can be slow because the model has to download and warm up.
+- If evidence is missing or retrieval cannot support a question, the chat should say there is not enough context instead of fabricating.
+
